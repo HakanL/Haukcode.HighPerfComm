@@ -23,10 +23,10 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
     private int droppedPackets;
     private int fullQueue;
     private long totalPackets;
-    private readonly ISubject<Exception> errorSubject;
+    protected readonly ISubject<Exception> errorSubject;
     private Task? receiveTask;
     private readonly Task sendTask;
-    private readonly Stopwatch clock = new();
+    private readonly Stopwatch receiveClock = new();
     private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
     private readonly Func<T> sendDataFactory;
     private readonly Memory<byte> receiveBufferMem;
@@ -176,13 +176,13 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
         }
     }
 
-    public double ReceiveClock => this.clock.Elapsed.TotalMilliseconds;
+    public double ReceiveClock => this.receiveClock.Elapsed.TotalMilliseconds;
 
     public void StartReceive()
     {
         this.receiveTask ??= Task.Run(Receiver);
 
-        this.clock.Restart();
+        this.receiveClock.Restart();
     }
 
     protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<T, Memory<byte>, int> packetWriter)
@@ -242,7 +242,7 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
                 var result = await ReceiveData(this.receiveBufferMem, this.shutdownCTS.Token);
 
                 // Capture the timestamp first so it's as accurate as possible
-                double timestampMS = this.clock.Elapsed.TotalMilliseconds;
+                double timestampMS = this.receiveClock.Elapsed.TotalMilliseconds;
 
                 if (result.ReceivedBytes > 0)
                 {

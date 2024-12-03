@@ -13,8 +13,6 @@ public class SendStatistics
 
     public int QueueLength { get; set; }
 
-    public int DestinationCount { get; set; }
-
     public int FullQueue { get; set; }
 
     public long TotalPackets { get; set; }
