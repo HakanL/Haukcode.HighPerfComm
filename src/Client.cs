@@ -24,7 +24,8 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
     private int fullQueue;
     private long totalPackets;
     protected readonly ISubject<Exception> errorSubject;
-    private Task? receiveTask;
+    private Task? receive1Task;
+    private Task? receive2Task;
     private readonly Task sendTask;
     private readonly Stopwatch receiveClock = new();
     private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
@@ -81,9 +82,16 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
 
             this.sendQueue.Writer.Complete();
 
-            if (this.receiveTask?.IsCanceled == false)
-                this.receiveTask?.Wait(5_000);
-            this.receiveTask?.Dispose();
+            if (this.receive1Task?.IsCanceled == false)
+                this.receive1Task?.Wait(5_000);
+            this.receive1Task?.Dispose();
+
+            if (this.receive2Task != null)
+            {
+                if (this.receive2Task?.IsCanceled == false)
+                    this.receive2Task?.Wait(5_000);
+                this.receive2Task?.Dispose();
+            }
 
             if (this.sendTask?.IsCanceled == false)
                 this.sendTask?.Wait(5_000);
@@ -180,7 +188,10 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
 
     public void StartReceive()
     {
-        this.receiveTask ??= Task.Run(Receiver);
+        this.receive1Task ??= Task.Run(() => Receiver(false));
+
+        if (SupportsTwoReceivers)
+            this.receive2Task ??= Task.Run(() => Receiver(true));
 
         this.receiveClock.Restart();
     }
@@ -229,17 +240,26 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
         }
     }
 
-    protected abstract ValueTask<(int ReceivedBytes, TResult Result)> ReceiveData(Memory<byte> memory, CancellationToken cancelToken);
+    protected abstract ValueTask<(int ReceivedBytes, TResult Result)> ReceiveData1(Memory<byte> memory, CancellationToken cancelToken);
+
+    protected abstract ValueTask<(int ReceivedBytes, TResult Result)> ReceiveData2(Memory<byte> memory, CancellationToken cancelToken);
+
+    protected abstract bool SupportsTwoReceivers { get; }
 
     protected abstract void ParseReceiveData(ReadOnlyMemory<byte> memory, TResult result, double timestampMS);
 
-    private async Task Receiver()
+    private async Task Receiver(bool receiver2)
     {
         while (!this.shutdownCTS.IsCancellationRequested)
         {
             try
             {
-                var result = await ReceiveData(this.receiveBufferMem, this.shutdownCTS.Token);
+                (int ReceivedBytes, TResult Result) result;
+
+                if (receiver2)
+                    result = await ReceiveData2(this.receiveBufferMem, this.shutdownCTS.Token);
+                else
+                    result = await ReceiveData1(this.receiveBufferMem, this.shutdownCTS.Token);
 
                 // Capture the timestamp first so it's as accurate as possible
                 double timestampMS = this.receiveClock.Elapsed.TotalMilliseconds;
