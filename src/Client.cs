@@ -24,13 +24,14 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
     private int fullQueue;
     private long totalPackets;
     protected readonly ISubject<Exception> errorSubject;
-    private Task? receive1Task;
-    private Task? receive2Task;
+    private Task? receiveTask1;
+    private Task? receiveTask2;
     private readonly Task sendTask;
     private readonly Stopwatch receiveClock = new();
     private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
     private readonly Func<T> sendDataFactory;
-    private readonly Memory<byte> receiveBufferMem;
+    private readonly Memory<byte> receiveBufferMem1;
+    private readonly Memory<byte> receiveBufferMem2;
 
     public Client(Func<T> sendDataFactory, int receiveBufferSize = 20480)
     {
@@ -61,9 +62,12 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
         this.errorSubject = new Subject<Exception>();
 
         var receiveBuffer = GC.AllocateArray<byte>(length: receiveBufferSize, pinned: true);
-        this.receiveBufferMem = receiveBuffer.AsMemory();
+        this.receiveBufferMem1 = receiveBuffer.AsMemory();
 
-        this.sendTask = Task.Run(Sender);
+        receiveBuffer = GC.AllocateArray<byte>(length: receiveBufferSize, pinned: true);
+        this.receiveBufferMem2 = receiveBuffer.AsMemory();
+
+        this.sendTask = Task.Factory.StartNew(Sender, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
     }
 
     public bool IsOperational => !this.shutdownCTS.IsCancellationRequested;
@@ -82,15 +86,15 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
 
             this.sendQueue.Writer.Complete();
 
-            if (this.receive1Task?.IsCanceled == false)
-                this.receive1Task?.Wait(5_000);
-            this.receive1Task?.Dispose();
+            if (this.receiveTask1?.IsCanceled == false)
+                this.receiveTask1?.Wait(5_000);
+            this.receiveTask1?.Dispose();
 
-            if (this.receive2Task != null)
+            if (this.receiveTask2 != null)
             {
-                if (this.receive2Task?.IsCanceled == false)
-                    this.receive2Task?.Wait(5_000);
-                this.receive2Task?.Dispose();
+                if (this.receiveTask2?.IsCanceled == false)
+                    this.receiveTask2?.Wait(5_000);
+                this.receiveTask2?.Dispose();
             }
 
             if (this.sendTask?.IsCanceled == false)
@@ -188,10 +192,10 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
 
     public void StartReceive()
     {
-        this.receive1Task ??= Task.Run(() => Receiver(false));
+        this.receiveTask1 ??= Task.Factory.StartNew(() => Receiver(false), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
 
         if (SupportsTwoReceivers)
-            this.receive2Task ??= Task.Run(() => Receiver(true));
+            this.receiveTask2 ??= Task.Factory.StartNew(() => Receiver(true), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
 
         this.receiveClock.Restart();
     }
@@ -255,18 +259,25 @@ public abstract class Client<T, TResult> : IDisposable where T : SendData
             try
             {
                 (int ReceivedBytes, TResult Result) result;
+                Memory<byte> receiveBufferMem;
 
                 if (receiver2)
-                    result = await ReceiveData2(this.receiveBufferMem, this.shutdownCTS.Token);
+                {
+                    result = await ReceiveData2(this.receiveBufferMem1, this.shutdownCTS.Token);
+                    receiveBufferMem = this.receiveBufferMem1;
+                }
                 else
-                    result = await ReceiveData1(this.receiveBufferMem, this.shutdownCTS.Token);
+                {
+                    result = await ReceiveData1(this.receiveBufferMem2, this.shutdownCTS.Token);
+                    receiveBufferMem = this.receiveBufferMem2;
+                }
 
                 // Capture the timestamp first so it's as accurate as possible
                 double timestampMS = this.receiveClock.Elapsed.TotalMilliseconds;
 
                 if (result.ReceivedBytes > 0)
                 {
-                    var readBuffer = this.receiveBufferMem[..result.ReceivedBytes];
+                    var readBuffer = receiveBufferMem[..result.ReceivedBytes];
 
                     ParseReceiveData(readBuffer, result.Result, timestampMS);
                 }
