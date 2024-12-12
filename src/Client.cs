@@ -14,13 +14,13 @@ using HdrHistogram;
 
 namespace Haukcode.HighPerfComm;
 
-public abstract class Client<T, TPacketType> : IDisposable where T : SendData
+public abstract class Client<TSendData, TPacketType> : IDisposable where TSendData : SendData
 {
     private readonly CancellationTokenSource senderCTS = new();
     private CancellationTokenSource? receiverCTS;
     private readonly HdrHistogram.Recorder sendRecorder;
     private readonly HdrHistogram.Recorder ageRecorder;
-    private readonly Channel<T> sendQueue;
+    private readonly Channel<TSendData> sendQueue;
     private readonly int receiveBufferSize;
     private int queueItemCounter;
     private int droppedPackets;
@@ -32,16 +32,14 @@ public abstract class Client<T, TPacketType> : IDisposable where T : SendData
     private readonly Task sendTask;
     private readonly Stopwatch receiveClock = new();
     private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
-    private readonly Func<T> sendDataFactory;
     private long objectsFromPipeline;
     private long objectsIntoChannel;
     private Pipe? receivePipeline;
 
-    public Client(Func<T> sendDataFactory, int packetSize)
+    public Client(int packetSize)
     {
         this.receiveBufferSize = packetSize + HeaderDataSize;
-        this.sendDataFactory = sendDataFactory;
-        this.sendQueue = Channel.CreateBounded<T>(new BoundedChannelOptions(10000)
+        this.sendQueue = Channel.CreateBounded<TSendData>(new BoundedChannelOptions(10000)
         {
             SingleReader = true,
             SingleWriter = true,
@@ -71,7 +69,7 @@ public abstract class Client<T, TPacketType> : IDisposable where T : SendData
 
     protected abstract ValueTask<(int ReceivedBytes, SocketReceiveMessageFromResult Result)> ReceiveData(Memory<byte> memory, CancellationToken cancelToken);
 
-    protected abstract ValueTask<int> SendPacketAsync(T sendData, ReadOnlyMemory<byte> payload);
+    protected abstract ValueTask<int> SendPacketAsync(TSendData sendData, ReadOnlyMemory<byte> payload);
 
     protected abstract void InitializeReceiveSocket();
 
@@ -178,7 +176,6 @@ public abstract class Client<T, TPacketType> : IDisposable where T : SendData
                     if (ex is OperationCanceledException)
                         continue;
 
-                    //Console.WriteLine($"Exception in Sender handler: {ex.Message}");
                     this.errorSubject.OnNext(ex);
 
                     if (ex is System.Net.Sockets.SocketException)
@@ -239,7 +236,7 @@ public abstract class Client<T, TPacketType> : IDisposable where T : SendData
         DisposeReceiveSocket();
     }
 
-    protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<T, Memory<byte>, int> packetWriter)
+    protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
     {
         if (!IsOperational)
         {
@@ -254,12 +251,12 @@ public abstract class Client<T, TPacketType> : IDisposable where T : SendData
 
         var memory = this.memoryPool.Rent(allocatePacketLength);
 
-        var newSendData = this.sendDataFactory();
+        var newSendData = sendDataFactory();
 
         newSendData.Data = memory;
         newSendData.Important = important;
 
-        int packetLength = packetWriter(newSendData, memory.Memory);
+        int packetLength = packetWriter(memory.Memory);
 
         newSendData.DataLength = packetLength;
 
@@ -463,8 +460,7 @@ public abstract class Client<T, TPacketType> : IDisposable where T : SendData
                 // We have enough data to read the packet size and details
                 ReadOnlySequence<byte> header = buffer.Slice(0, HeaderDataSize);
 
-                int advanceBytes = 0;
-
+                int advanceBytes;
                 if (header.IsSingleSegment)
                 {
                     GetSocketData(header.First.Span, out int packetSize, out double timestampMS, out IPEndPoint sourceIP, out IPAddress destinationIP);
