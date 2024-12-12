@@ -386,7 +386,7 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
         await writer.CompleteAsync();
     }
 
-    public void StartRecordPipeline<TChannelType>(Channel<TChannelType> outChannel, Func<TPacketType, TChannelType?> transformer)
+    public void StartRecordPipeline(Func<TPacketType, Task> channelWriter, Action writeComplete)
     {
         this.receivePipeline = new Pipe(new PipeOptions(pauseWriterThreshold: 10_000_000));
 
@@ -395,11 +395,16 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
 
         this.parserTask = Task.Factory.StartNew(async () =>
         {
-            await ParseFromPipeAsync(this.receivePipeline.Reader, outChannel, transformer, CancellationToken.None);
+            await ParseFromPipeAsync(this.receivePipeline.Reader, channelWriter, CancellationToken.None);
+
+            writeComplete();
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
-    private async Task ParseFromPipeAsync<TChannelType>(PipeReader reader, Channel<TChannelType> outputChannel, Func<TPacketType, TChannelType?> transformer, CancellationToken cancellationToken)
+    private async Task ParseFromPipeAsync(
+        PipeReader reader,
+        Func<TPacketType, Task> channelWriter,
+        CancellationToken cancellationToken)
     {
         async Task processData(ReadOnlyMemory<byte> data, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP)
         {
@@ -410,12 +415,7 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
                 {
                     Interlocked.Increment(ref this.objectsIntoChannel);
 
-                    var transformedObject = transformer(parsedObject);
-
-                    if (transformedObject != null)
-                    {
-                        await outputChannel.Writer.WriteAsync(transformedObject, cancellationToken);
-                    }
+                    await channelWriter(parsedObject);
                 }
             }
             catch (Exception ex)
@@ -495,7 +495,5 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
         }
 
         await reader.CompleteAsync();
-
-        outputChannel.Writer.Complete();
     }
 }
