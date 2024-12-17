@@ -151,7 +151,11 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
 
                 try
                 {
-                    this.ageRecorder.RecordValue(sendData.Enqueued.ElapsedTicks);
+                    if (!sendData.Important)
+                    {
+                        // Ignore the important packets when recording age, not relevant
+                        this.ageRecorder.RecordValue(sendData.Enqueued.ElapsedTicks);
+                    }
 
                     if (sendData.AgeMS > 100 && !sendData.Important)
                     {
@@ -166,8 +170,12 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
                     // Send packet
                     await SendPacketAsync(sendData, sendData.Data.Memory[..sendData.DataLength]);
 
-                    long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
-                    this.sendRecorder.RecordValue(elapsedTicks);
+                    if (!sendData.Important)
+                    {
+                        // Ignore recording important packets since we may have a burst of a lot of them (blackouts for example)
+                        long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
+                        this.sendRecorder.RecordValue(elapsedTicks);
+                    }
 
                     this.totalPackets++;
                 }
