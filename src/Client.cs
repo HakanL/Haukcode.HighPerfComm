@@ -157,7 +157,7 @@ public abstract class Client<TSendData, TPacketType> : IDisposable where TSendDa
                         this.ageRecorder.RecordValue(sendData.Enqueued.ElapsedTicks);
                     }
 
-                    if (sendData.AgeMS > 100 && !sendData.Important)
+                    if (sendData.AgeMS > 200 && !sendData.Important)
                     {
                         // Old, discard
                         this.droppedPackets++;
