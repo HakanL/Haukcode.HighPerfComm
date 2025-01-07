@@ -5,19 +5,20 @@ using System.Text;
 using System.Threading.Tasks;
 using HdrHistogram;
 
-namespace Haukcode.HighPerfComm;
-
-public class SendStatistics
+namespace Haukcode.HighPerfComm
 {
-    public int DroppedPackets { get; set; }
+    public class SendStatistics
+    {
+        public int DroppedPackets { get; set; }
 
-    public int QueueLength { get; set; }
+        public int QueueLength { get; set; }
 
-    public int FullQueue { get; set; }
+        public int FullQueue { get; set; }
 
-    public long TotalPackets { get; set; }
-    
-    public HistogramBase? SendStats { get; set; }
+        public long TotalPackets { get; set; }
 
-    public HistogramBase? AgeStats { get; set; }
+        public HistogramBase? SendStats { get; set; }
+
+        public HistogramBase? AgeStats { get; set; }
+    }
 }
