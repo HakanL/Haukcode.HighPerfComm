@@ -77,7 +77,11 @@ namespace Haukcode.HighPerfComm
 
         protected abstract void DisposeReceiveSocket();
 
+#if NETSTANDARD2_1
         protected abstract TPacketType TryParseObject(ReadOnlyMemory<byte> buffer, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP);
+#else
+        protected abstract TPacketType? TryParseObject(ReadOnlyMemory<byte> buffer, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP);
+#endif
 
         public bool IsOperational => !this.senderCTS.IsCancellationRequested;
 
