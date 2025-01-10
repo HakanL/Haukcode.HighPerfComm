@@ -160,15 +160,15 @@ namespace Haukcode.HighPerfComm
                         if (!sendData.Important)
                         {
                             // Ignore the important packets when recording age, not relevant
-                            this.ageRecorder.RecordValue(sendData.Enqueued.ElapsedTicks);
-                        }
+                            this.ageRecorder.RecordValue(sendData.AgeTicks);
 
-                        if (sendData.AgeMS > 200 && !sendData.Important)
-                        {
-                            // Old, discard
-                            this.droppedPackets++;
-                            //Console.WriteLine($"Age {sendData.Enqueued.Elapsed.TotalMilliseconds:N2}   queue length = {this.sendQueue.Count}   Dropped = {this.droppedPackets}");
-                            continue;
+                            if (sendData.AgeMS > 200)
+                            {
+                                // Old, discard
+                                this.droppedPackets++;
+                                //Console.WriteLine($"Age {sendData.Enqueued.Elapsed.TotalMilliseconds:N2}   queue length = {this.sendQueue.Count}   Dropped = {this.droppedPackets}");
+                                continue;
+                            }
                         }
 
                         long startTimestamp = Stopwatch.GetTimestamp();
@@ -273,6 +273,8 @@ namespace Haukcode.HighPerfComm
             int packetLength = packetWriter(memory.Memory);
 
             newSendData.DataLength = packetLength;
+
+            newSendData.StartAgeStopwatch();
 
             if (this.sendQueue.Writer.TryWrite(newSendData))
             {
