@@ -38,10 +38,10 @@ namespace Haukcode.HighPerfComm
         private long objectsIntoChannel;
         private Pipe? receivePipeline;
 
-        public Client(int packetSize)
+        public Client(int packetSize, Func<TPacketType, Task>? channelWriter, Action? channelWriterComplete)
         {
             this.receiveBufferSize = packetSize + HeaderDataSize;
-            this.sendQueue = Channel.CreateBounded<TSendData>(new BoundedChannelOptions(10000)
+            this.sendQueue = Channel.CreateBounded<TSendData>(new BoundedChannelOptions(10_000)
             {
                 SingleReader = true,
                 SingleWriter = true,
@@ -67,6 +67,19 @@ namespace Haukcode.HighPerfComm
             this.errorSubject = new Subject<Exception>();
 
             this.sendTask = Task.Factory.StartNew(Sender, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+            this.receivePipeline = new Pipe(new PipeOptions(pauseWriterThreshold: 10_000_000));
+
+            if (channelWriter != null)
+            {
+                this.parserTask = Task.Factory.StartNew(async () =>
+                {
+                    // Parse and then call the transfomer to get our internal deconstructed data
+                    await ParseFromPipeAsync(this.receivePipeline.Reader, channelWriter, CancellationToken.None);
+
+                    channelWriterComplete?.Invoke();
+                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            }
         }
 
         protected abstract ValueTask<(int ReceivedBytes, SocketReceiveMessageFromResult Result)> ReceiveData(Memory<byte> memory, CancellationToken cancelToken);
@@ -210,7 +223,7 @@ namespace Haukcode.HighPerfComm
 
         public double ReceiveClock => this.receiveClock.Elapsed.TotalMilliseconds;
 
-        private void StartReceive()
+        protected void StartReceive()
         {
             if (this.receiverCTS != null)
                 throw new Exception("Already running");
@@ -227,7 +240,7 @@ namespace Haukcode.HighPerfComm
             this.receiveClock.Restart();
         }
 
-        public void StopReceive()
+        private void StopReceive()
         {
             this.receiverCTS?.Cancel();
 
@@ -400,21 +413,6 @@ namespace Haukcode.HighPerfComm
 
             // Signal that writing is complete
             await writer.CompleteAsync();
-        }
-
-        public void StartRecordPipeline(Func<TPacketType, Task> channelWriter, Action writeComplete)
-        {
-            this.receivePipeline = new Pipe(new PipeOptions(pauseWriterThreshold: 10_000_000));
-
-            // Start the pipeline components (we leave it running once it's started)
-            StartReceive();
-
-            this.parserTask = Task.Factory.StartNew(async () =>
-            {
-                await ParseFromPipeAsync(this.receivePipeline.Reader, channelWriter, CancellationToken.None);
-
-                writeComplete();
-            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         private async Task ParseFromPipeAsync(
