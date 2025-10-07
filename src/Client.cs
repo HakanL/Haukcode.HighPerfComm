@@ -45,6 +45,7 @@ namespace Haukcode.HighPerfComm
             {
                 SingleReader = true,
                 SingleWriter = true,
+                AllowSynchronousContinuations = true,
                 FullMode = BoundedChannelFullMode.Wait
             });
 
