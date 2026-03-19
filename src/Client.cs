@@ -310,6 +310,34 @@ namespace Haukcode.HighPerfComm
             }
         }
 
+        protected async ValueTask SendImmediateAsync(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
+        {
+            if (!IsOperational)
+                return;
+
+            var memory = this.memoryPool.Rent(allocatePacketLength);
+
+            try
+            {
+                var sendData = sendDataFactory();
+
+                sendData.Data = memory;
+                sendData.Important = important;
+
+                int packetLength = packetWriter(memory.Memory);
+
+                sendData.DataLength = packetLength;
+
+                await SendPacketAsync(sendData, memory.Memory[..packetLength]);
+
+                this.totalPackets++;
+            }
+            finally
+            {
+                memory.Dispose();
+            }
+        }
+
         protected const int HeaderDataSize = 24;
 
         private void WriteSocketDataToBuffer(int receivedBytes, long timestampTicks, IPEndPoint remoteEndPoint, IPAddress destAddress, Span<byte> buffer)
