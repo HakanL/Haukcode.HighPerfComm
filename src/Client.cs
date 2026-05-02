@@ -208,9 +208,15 @@ namespace Haukcode.HighPerfComm
 
                         if (ex is System.Net.Sockets.SocketException)
                         {
-                            // Network unreachable
-                            this.senderCTS.Cancel();
-                            break;
+                            // Transient send failure (e.g. errno 101 Network unreachable during a NIC flap).
+                            // Don't kill the sender — back off briefly and keep draining the queue so we recover when routing returns.
+                            try
+                            {
+                                await Task.Delay(100, this.senderCTS.Token);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                            }
                         }
                     }
                     finally
@@ -433,9 +439,14 @@ namespace Haukcode.HighPerfComm
 
                     if (ex is System.Net.Sockets.SocketException)
                     {
-                        // Network unreachable
-                        this.receiverCTS.Cancel();
-                        break;
+                        // Transient receive failure during a NIC flap — back off briefly and keep listening.
+                        try
+                        {
+                            await Task.Delay(100, this.receiverCTS.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                        }
                     }
                 }
             }
