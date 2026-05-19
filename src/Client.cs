@@ -37,6 +37,11 @@ namespace Haukcode.HighPerfComm
         private long objectsFromPipeline;
         private long objectsIntoChannel;
         private Pipe? receivePipeline;
+        private long lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
+        private long firstSendFailureTimestamp;
+        private long lastErrorEmitTimestamp;
+        private const double SendFaultThresholdMS = 3_000;
+        private const double ErrorEmitThrottleMS = 5_000;
 
         public Client(int packetSize, Func<TPacketType, Task>? channelWriter, Action? channelWriterComplete)
         {
@@ -97,7 +102,17 @@ namespace Haukcode.HighPerfComm
         protected abstract TPacketType? TryParseObject(ReadOnlyMemory<byte> buffer, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP);
 #endif
 
-        public bool IsOperational => !this.senderCTS.IsCancellationRequested;
+        public bool IsOperational => !this.senderCTS.IsCancellationRequested && !HasSustainedSendFailure;
+
+        // True once sends have been failing continuously for longer than the
+        // threshold (e.g. the NIC we bound to went away after a network change).
+        // Resets as soon as a single send succeeds.
+        private bool HasSustainedSendFailure
+            => this.firstSendFailureTimestamp != 0
+                && ElapsedMs(this.firstSendFailureTimestamp) >= SendFaultThresholdMS;
+
+        private static double ElapsedMs(long startTimestamp)
+            => (Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / Stopwatch.Frequency;
 
         public void Dispose()
         {
@@ -198,16 +213,31 @@ namespace Haukcode.HighPerfComm
                         }
 
                         this.totalPackets++;
+
+                        // Successful send clears any pending fault state.
+                        this.lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
+                        this.firstSendFailureTimestamp = 0;
                     }
                     catch (Exception ex)
                     {
                         if (ex is OperationCanceledException)
                             continue;
 
-                        this.errorSubject.OnNext(ex);
-
                         if (ex is System.Net.Sockets.SocketException)
                         {
+                            if (this.firstSendFailureTimestamp == 0)
+                                this.firstSendFailureTimestamp = Stopwatch.GetTimestamp();
+
+                            // Throttle notifications so a persistent failure (e.g. the bound
+                            // NIC went away after a network change) doesn't spam the log once
+                            // per packet. The first failure is reported immediately.
+                            if (ElapsedMs(this.lastErrorEmitTimestamp) >= ErrorEmitThrottleMS)
+                            {
+                                this.lastErrorEmitTimestamp = Stopwatch.GetTimestamp();
+
+                                this.errorSubject.OnNext(ex);
+                            }
+
                             // Transient send failure (e.g. errno 101 Network unreachable during a NIC flap).
                             // Don't kill the sender — back off briefly and keep draining the queue so we recover when routing returns.
                             try
@@ -217,6 +247,10 @@ namespace Haukcode.HighPerfComm
                             catch (OperationCanceledException)
                             {
                             }
+                        }
+                        else
+                        {
+                            this.errorSubject.OnNext(ex);
                         }
                     }
                     finally
