@@ -37,6 +37,15 @@ namespace Haukcode.HighPerfComm
         private long objectsFromPipeline;
         private long objectsIntoChannel;
         private Pipe? receivePipeline;
+
+        // Per-source/destination IP caches so the parse thread (the single-reader
+        // ParseFromPipeAsync consumer) doesn't allocate an IPEndPoint + two IPAddress objects
+        // on every received packet. Capped so a flood of spoofed source addresses can't grow
+        // them without bound. Only touched from GetSocketData on the parse thread.
+        private const int IpCacheCap = 512;
+        private readonly Dictionary<uint, IPAddress> ipAddressCache = new Dictionary<uint, IPAddress>();
+        private readonly Dictionary<(uint Address, int Port), IPEndPoint> sourceEndPointCache = new Dictionary<(uint Address, int Port), IPEndPoint>();
+
         private long lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
         private long firstSendFailureTimestamp;
         private long lastErrorEmitTimestamp;
@@ -464,8 +473,37 @@ namespace Haukcode.HighPerfComm
             long timestampTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer.Slice(4));
             timestampMS = (double)timestampTicks / Stopwatch.Frequency * 1000;
 
-            source = new IPEndPoint(new IPAddress(buffer.Slice(12, 4)), BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(16, 4)));
-            destination = new IPAddress(buffer.Slice(20, 4));
+            var sourceAddressBytes = buffer.Slice(12, 4);
+            uint sourceKey = BinaryPrimitives.ReadUInt32LittleEndian(sourceAddressBytes);
+            int sourcePort = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(16, 4));
+
+            if (!this.sourceEndPointCache.TryGetValue((sourceKey, sourcePort), out var sourceEndPoint))
+            {
+                if (this.sourceEndPointCache.Count >= IpCacheCap)
+                    this.sourceEndPointCache.Clear();
+
+                sourceEndPoint = new IPEndPoint(GetCachedIpAddress(sourceKey, sourceAddressBytes), sourcePort);
+                this.sourceEndPointCache[(sourceKey, sourcePort)] = sourceEndPoint;
+            }
+
+            source = sourceEndPoint;
+
+            var destinationAddressBytes = buffer.Slice(20, 4);
+            destination = GetCachedIpAddress(BinaryPrimitives.ReadUInt32LittleEndian(destinationAddressBytes), destinationAddressBytes);
+        }
+
+        private IPAddress GetCachedIpAddress(uint key, ReadOnlySpan<byte> addressBytes)
+        {
+            if (!this.ipAddressCache.TryGetValue(key, out var address))
+            {
+                if (this.ipAddressCache.Count >= IpCacheCap)
+                    this.ipAddressCache.Clear();
+
+                address = new IPAddress(addressBytes);
+                this.ipAddressCache[key] = address;
+            }
+
+            return address;
         }
 
         private void Receiver()
