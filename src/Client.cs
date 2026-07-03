@@ -43,8 +43,8 @@ namespace Haukcode.HighPerfComm
         // on every received packet. Capped so a flood of spoofed source addresses can't grow
         // them without bound. Only touched from GetSocketData on the parse thread.
         private const int IpCacheCap = 512;
-        private readonly Dictionary<uint, IPAddress> ipAddressCache = new Dictionary<uint, IPAddress>();
-        private readonly Dictionary<(uint Address, int Port), IPEndPoint> sourceEndPointCache = new Dictionary<(uint Address, int Port), IPEndPoint>();
+        private readonly Dictionary<uint, IPAddress> ipAddressCache = new();
+        private readonly Dictionary<(uint Address, int Port), IPEndPoint> sourceEndPointCache = new();
 
         private long lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
         private long firstSendFailureTimestamp;
