@@ -31,7 +31,7 @@ namespace Haukcode.HighPerfComm
         protected readonly ISubject<Exception> errorSubject;
         private Thread? receiveThread;
         private Task? parserTask;
-        private readonly Task sendTask;
+        private readonly Thread sendThread;
         private readonly Stopwatch receiveClock = new Stopwatch();
         private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
         private long objectsFromPipeline;
@@ -72,7 +72,18 @@ namespace Haukcode.HighPerfComm
 
             this.errorSubject = new Subject<Exception>();
 
-            this.sendTask = Task.Factory.StartNew(Sender, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            // Run the send loop on its own dedicated thread with blocking sends, mirroring
+            // the receive loop: an async send loop depends on the shared thread pool for
+            // socket completions and queue wakeups, so pool starvation delayed queued
+            // packets past the age cutoff and dropped them. A blocking send is serviced
+            // directly by the kernel.
+            this.sendThread = new Thread(Sender)
+            {
+                Name = $"{GetType().Name} sender",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal
+            };
+            this.sendThread.Start();
 
             this.receivePipeline = new Pipe(new PipeOptions(pauseWriterThreshold: 10_000_000));
 
@@ -98,7 +109,13 @@ namespace Haukcode.HighPerfComm
         /// </summary>
         protected abstract int ReceiveData(Memory<byte> memory, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
-        protected abstract ValueTask<int> SendPacketAsync(TSendData sendData, ReadOnlyMemory<byte> payload);
+        /// <summary>
+        /// Blocking send of a single packet. Called on the dedicated send thread (and from
+        /// SendImmediateAsync on caller threads); must block until the packet is handed to
+        /// the kernel. A synchronous send keeps outgoing packet pacing independent of the
+        /// shared thread pool, which async socket completions are dispatched through.
+        /// </summary>
+        protected abstract int SendPacket(TSendData sendData, ReadOnlyMemory<byte> payload);
 
         protected abstract void InitializeReceiveSocket();
 
@@ -138,9 +155,7 @@ namespace Haukcode.HighPerfComm
 
                 StopReceive();
 
-                if (this.sendTask?.IsCanceled == false)
-                    this.sendTask?.Wait(5_000);
-                this.sendTask?.Dispose();
+                this.sendThread.Join(5_000);
             }
         }
 
@@ -184,11 +199,23 @@ namespace Haukcode.HighPerfComm
             return receiveStatistics;
         }
 
-        private async Task Sender()
+        private void Sender()
         {
+            var reader = this.sendQueue.Reader;
+
             while (!this.senderCTS.IsCancellationRequested)
             {
-                await foreach (var sendData in this.sendQueue.Reader.ReadAllAsync())
+                if (!reader.TryRead(out var sendData))
+                {
+                    // Block until data is available or the channel is completed. The waiter
+                    // is completed inline by the writer (AllowSynchronousContinuations), so
+                    // waking up doesn't depend on the thread pool.
+                    if (!reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
+                        break;
+
+                    continue;
+                }
+
                 {
                     Interlocked.Decrement(ref this.queueItemCounter);
 
@@ -211,7 +238,7 @@ namespace Haukcode.HighPerfComm
                         long startTimestamp = Stopwatch.GetTimestamp();
 
                         // Send packet
-                        await SendPacketAsync(sendData, sendData.Data.Memory[..sendData.DataLength]);
+                        SendPacket(sendData, sendData.Data.Memory[..sendData.DataLength]);
 
                         if (!sendData.Important)
                         {
@@ -248,13 +275,7 @@ namespace Haukcode.HighPerfComm
 
                             // Transient send failure (e.g. errno 101 Network unreachable during a NIC flap).
                             // Don't kill the sender — back off briefly and keep draining the queue so we recover when routing returns.
-                            try
-                            {
-                                await Task.Delay(100, this.senderCTS.Token);
-                            }
-                            catch (OperationCanceledException)
-                            {
-                            }
+                            this.senderCTS.Token.WaitHandle.WaitOne(100);
                         }
                         else
                         {
@@ -370,10 +391,10 @@ namespace Haukcode.HighPerfComm
             }
         }
 
-        protected async ValueTask SendImmediateAsync(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
+        protected ValueTask SendImmediateAsync(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
         {
             if (!IsOperational)
-                return;
+                return default;
 
             var memory = this.memoryPool.Rent(allocatePacketLength);
 
@@ -388,7 +409,7 @@ namespace Haukcode.HighPerfComm
 
                 sendData.DataLength = packetLength;
 
-                await SendPacketAsync(sendData, memory.Memory[..packetLength]);
+                SendPacket(sendData, memory.Memory[..packetLength]);
 
                 this.totalPackets++;
             }
@@ -396,6 +417,8 @@ namespace Haukcode.HighPerfComm
             {
                 memory.Dispose();
             }
+
+            return default;
         }
 
         protected const int HeaderDataSize = 24;
