@@ -29,7 +29,7 @@ namespace Haukcode.HighPerfComm
         private int fullQueue;
         private long totalPackets;
         protected readonly ISubject<Exception> errorSubject;
-        private Task? receiveTask;
+        private Thread? receiveThread;
         private Task? parserTask;
         private readonly Task sendTask;
         private readonly Stopwatch receiveClock = new Stopwatch();
@@ -88,7 +88,15 @@ namespace Haukcode.HighPerfComm
             }
         }
 
-        protected abstract ValueTask<(int ReceivedBytes, SocketReceiveMessageFromResult Result)> ReceiveData(Memory<byte> memory, CancellationToken cancelToken);
+        /// <summary>
+        /// Blocking receive of a single packet into <paramref name="memory"/>. Called on the
+        /// dedicated receive thread; must block until a packet arrives or the receive socket
+        /// is closed (throw on close/shutdown). A synchronous read is woken directly by the
+        /// kernel, so packet-arrival timestamping never depends on the shared thread pool —
+        /// async socket completions are dispatched via the thread pool and get delayed when
+        /// the pool is saturated, which corrupted recorded timestamps (gap-then-burst).
+        /// </summary>
+        protected abstract int ReceiveData(Memory<byte> memory, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
         protected abstract ValueTask<int> SendPacketAsync(TSendData sendData, ReadOnlyMemory<byte> payload);
 
@@ -276,7 +284,19 @@ namespace Haukcode.HighPerfComm
 
             this.receiverCTS = new CancellationTokenSource();
 
-            this.receiveTask = Task.Factory.StartNew(Receiver, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            // Run the receive loop on its own dedicated thread with blocking socket reads.
+            // The kernel wakes the thread directly on packet arrival, so the packet-arrival
+            // timestamp capture never depends on the shared thread pool. With the previous
+            // pool-scheduled async loop, a saturated pool (even from unrelated code in the
+            // process) left received packets in the kernel buffer for a second or more and
+            // they were then drained in a burst with near-identical timestamps.
+            this.receiveThread = new Thread(Receiver)
+            {
+                Name = $"{GetType().Name} receiver",
+                IsBackground = true,
+                Priority = ThreadPriority.AboveNormal
+            };
+            this.receiveThread.Start();
 
             this.receiveClock.Restart();
         }
@@ -285,9 +305,11 @@ namespace Haukcode.HighPerfComm
         {
             this.receiverCTS?.Cancel();
 
-            if (this.receiveTask?.IsCanceled == false)
-                this.receiveTask?.Wait(5_000);
-            this.receiveTask?.Dispose();
+            // Close the socket first — that unblocks the receive thread's blocking read
+            // so it can observe the cancellation and exit.
+            DisposeReceiveSocket();
+
+            this.receiveThread?.Join(5_000);
 
             if (this.parserTask?.IsCanceled == false)
                 this.parserTask?.Wait(5_000);
@@ -295,13 +317,11 @@ namespace Haukcode.HighPerfComm
 
             this.receiverCTS?.Dispose();
 
-            this.receiveTask = null;
+            this.receiveThread = null;
             this.receiverCTS = null;
             this.parserTask = null;
 
             this.receivePipeline = null;
-
-            DisposeReceiveSocket();
         }
 
         protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
@@ -425,7 +445,7 @@ namespace Haukcode.HighPerfComm
             destination = new IPAddress(buffer.Slice(20, 4));
         }
 
-        private async Task Receiver()
+        private void Receiver()
         {
             var writer = this.receivePipeline!.Writer;
 
@@ -435,30 +455,32 @@ namespace Haukcode.HighPerfComm
                 {
                     Memory<byte> memory = writer.GetMemory(this.receiveBufferSize);
 
-                    var result = await ReceiveData(memory[HeaderDataSize..], this.receiverCTS.Token);
+                    int receivedBytes = ReceiveData(memory[HeaderDataSize..], out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
                     // Capture the timestamp first so it's as accurate as possible
                     long timestampTicks = this.receiveClock.ElapsedTicks;
 
-                    if (!(result.Result.RemoteEndPoint is IPEndPoint remoteEndPoint) ||
+                    if (remoteEndPoint == null || destinationAddress == null ||
                         remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
-                        result.Result.PacketInformation.Address.AddressFamily != AddressFamily.InterNetwork)
+                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
                     {
                         // Missing or not IPv4
                         continue;
                     }
 
-                    int receivedBytes = result.ReceivedBytes;
                     if (receivedBytes > 0)
                     {
-                        WriteSocketDataToBuffer(receivedBytes, timestampTicks, remoteEndPoint, result.Result.PacketInformation.Address, memory.Span);
+                        WriteSocketDataToBuffer(receivedBytes, timestampTicks, remoteEndPoint, destinationAddress, memory.Span);
 
                         // Commit data to the pipe
                         writer.Advance(receivedBytes + HeaderDataSize);
 
                         Interlocked.Increment(ref this.objectsFromPipeline);
 
-                        FlushResult flushResult = await writer.FlushAsync(this.receiverCTS.Token);
+                        // Below the pause threshold this completes synchronously; if the parser
+                        // is far behind we block this thread, which is the desired backpressure.
+                        ValueTask<FlushResult> flushTask = writer.FlushAsync();
+                        FlushResult flushResult = flushTask.IsCompletedSuccessfully ? flushTask.Result : flushTask.AsTask().GetAwaiter().GetResult();
 
                         if (flushResult.IsCompleted)
                             break;
@@ -466,6 +488,9 @@ namespace Haukcode.HighPerfComm
                 }
                 catch (Exception ex)
                 {
+                    if (this.receiverCTS.IsCancellationRequested)
+                        break;
+
                     if (!(ex is OperationCanceledException))
                     {
                         this.errorSubject.OnNext(ex);
@@ -474,19 +499,13 @@ namespace Haukcode.HighPerfComm
                     if (ex is System.Net.Sockets.SocketException)
                     {
                         // Transient receive failure during a NIC flap — back off briefly and keep listening.
-                        try
-                        {
-                            await Task.Delay(100, this.receiverCTS.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                        }
+                        Thread.Sleep(100);
                     }
                 }
             }
 
             // Signal that writing is complete
-            await writer.CompleteAsync();
+            writer.Complete();
         }
 
         private async Task ParseFromPipeAsync(
