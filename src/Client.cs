@@ -23,7 +23,17 @@ namespace Haukcode.HighPerfComm
         private CancellationTokenSource? receiverCTS;
         private readonly HdrHistogram.Recorder sendRecorder;
         private readonly HdrHistogram.Recorder ageRecorder;
-        private readonly Channel<TSendData> sendQueue;
+
+        // One queue + one dedicated thread + (in the derived client) one socket per sender shard.
+        // A single sender thread is CPU-bound at ~20 us per packet on an RPi4 -- the cost is the
+        // kernel's per-packet UDP/IP/multicast work, not syscall entry, so batching (sendmmsg)
+        // only buys ~35% while sharding across cores scales ~2.4x on a 4-core box. Callers pick a
+        // shard key (the universe id for DMX protocols); every packet with the same key lands on
+        // the same thread and socket, which is what keeps per-universe sequence numbers ordered.
+        private readonly Channel<TSendData>[] sendQueues;
+        private readonly Thread[] sendThreads;
+        private readonly int senderCount;
+
         private readonly int receiveBufferSize;
         private int queueItemCounter;
         private int droppedPackets;
@@ -32,14 +42,14 @@ namespace Haukcode.HighPerfComm
         protected readonly ISubject<Exception> errorSubject;
         private Thread? receiveThread;
         private Task? parserTask;
-        private readonly Thread sendThread;
         private readonly Stopwatch receiveClock = new Stopwatch();
         private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
 
         // Pool of spent TSendData objects so the hot send path doesn't allocate a new one per
-        // packet (~30k/s at the throughput ceiling). SPSC: the sender thread returns objects
-        // after transmit; the (single) queue-writer thread rents via RentSendData. Bounded so a
-        // client whose factory doesn't rent (leaves the pool filling) can't grow it without limit.
+        // packet (tens of thousands per second at the throughput ceiling). Multi-producer now that
+        // several sender threads return objects after transmit; the (single) queue-writer thread
+        // rents via RentSendData. ConcurrentQueue handles that. Bounded so a client whose factory
+        // doesn't rent (leaves the pool filling) can't grow it without limit.
         private readonly ConcurrentQueue<TSendData> sendDataPool = new();
         private const int SendDataPoolCap = 2048;
         private long objectsFromPipeline;
@@ -60,16 +70,33 @@ namespace Haukcode.HighPerfComm
         private const double SendFaultThresholdMS = 3_000;
         private const double ErrorEmitThrottleMS = 5_000;
 
-        public Client(int packetSize, Func<TPacketType, Task>? channelWriter, Action? channelWriterComplete)
+        /// <param name="senderCount">
+        /// Number of sender shards (thread + queue + socket each). Defaults to 1, which is the
+        /// original single-threaded behavior. Raise it to spread the kernel's per-packet send cost
+        /// across cores when one sender thread saturates.
+        /// </param>
+        public Client(int packetSize, Func<TPacketType, Task>? channelWriter, Action? channelWriterComplete, int senderCount = 1)
         {
+            if (senderCount < 1)
+                throw new ArgumentOutOfRangeException(nameof(senderCount));
+
             this.receiveBufferSize = packetSize + HeaderDataSize;
-            this.sendQueue = Channel.CreateBounded<TSendData>(new BoundedChannelOptions(10_000)
+            this.senderCount = senderCount;
+            this.sendQueues = new Channel<TSendData>[senderCount];
+            this.sendThreads = new Thread[senderCount];
+
+            for (int i = 0; i < senderCount; i++)
             {
-                SingleReader = true,
-                SingleWriter = true,
-                AllowSynchronousContinuations = true,
-                FullMode = BoundedChannelFullMode.Wait
-            });
+                // Each shard keeps the original bound, so total capacity scales with the shard
+                // count and one busy universe range can't starve another.
+                this.sendQueues[i] = Channel.CreateBounded<TSendData>(new BoundedChannelOptions(10_000)
+                {
+                    SingleReader = true,
+                    SingleWriter = true,
+                    AllowSynchronousContinuations = true,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+            }
 
             this.sendRecorder = HistogramFactory
                 .With64BitBucketSize()                  //LongHistogram
@@ -89,18 +116,24 @@ namespace Haukcode.HighPerfComm
 
             this.errorSubject = new Subject<Exception>();
 
-            // Run the send loop on its own dedicated thread with blocking sends, mirroring
+            // Run each send loop on its own dedicated thread with blocking sends, mirroring
             // the receive loop: an async send loop depends on the shared thread pool for
             // socket completions and queue wakeups, so pool starvation delayed queued
             // packets past the age cutoff and dropped them. A blocking send is serviced
             // directly by the kernel.
-            this.sendThread = new Thread(Sender)
+            for (int i = 0; i < senderCount; i++)
             {
-                Name = $"{GetType().Name} sender",
-                IsBackground = true,
-                Priority = ThreadPriority.AboveNormal
-            };
-            this.sendThread.Start();
+                int senderIndex = i;
+
+                this.sendThreads[i] = new Thread(() => Sender(senderIndex))
+                {
+                    Name = senderCount == 1 ? $"{GetType().Name} sender" : $"{GetType().Name} sender {senderIndex}",
+                    IsBackground = true,
+                    Priority = ThreadPriority.AboveNormal
+                };
+
+                this.sendThreads[i].Start();
+            }
 
             this.receivePipeline = new Pipe(new PipeOptions(pauseWriterThreshold: 10_000_000));
 
@@ -132,7 +165,17 @@ namespace Haukcode.HighPerfComm
         /// the kernel. A synchronous send keeps outgoing packet pacing independent of the
         /// shared thread pool, which async socket completions are dispatched through.
         /// </summary>
-        protected abstract int SendPacket(TSendData sendData, ReadOnlyMemory<byte> payload);
+        /// <param name="senderIndex">
+        /// Which sender shard is calling, 0..SenderCount-1. Implementations with more than one
+        /// shard must send on that shard's own socket: one socket driven by several threads
+        /// serializes on the kernel's socket lock and throws the scaling away.
+        /// </param>
+        protected abstract int SendPacket(TSendData sendData, ReadOnlyMemory<byte> payload, int senderIndex);
+
+        /// <summary>
+        /// Number of sender shards. Derived clients need one socket per shard.
+        /// </summary>
+        protected int SenderCount => this.senderCount;
 
         protected abstract void InitializeReceiveSocket();
 
@@ -168,11 +211,13 @@ namespace Haukcode.HighPerfComm
             {
                 this.senderCTS.Cancel();
 
-                this.sendQueue.Writer.Complete();
+                foreach (var queue in this.sendQueues)
+                    queue.Writer.Complete();
 
                 StopReceive();
 
-                this.sendThread.Join(5_000);
+                foreach (var thread in this.sendThreads)
+                    thread.Join(5_000);
             }
         }
 
@@ -195,10 +240,10 @@ namespace Haukcode.HighPerfComm
 
             if (reset)
             {
-                // Reset
-                this.droppedPackets = 0;
-                this.fullQueue = 0;
-                this.totalPackets = 0;
+                // Reset. Interlocked because several sender threads increment these.
+                Interlocked.Exchange(ref this.droppedPackets, 0);
+                Interlocked.Exchange(ref this.fullQueue, 0);
+                Interlocked.Exchange(ref this.totalPackets, 0);
             }
 
             return sendStatistics;
@@ -216,9 +261,9 @@ namespace Haukcode.HighPerfComm
             return receiveStatistics;
         }
 
-        private void Sender()
+        private void Sender(int senderIndex)
         {
-            var reader = this.sendQueue.Reader;
+            var reader = this.sendQueues[senderIndex].Reader;
 
             while (!this.senderCTS.IsCancellationRequested)
             {
@@ -246,16 +291,15 @@ namespace Haukcode.HighPerfComm
                             if (sendData.AgeMS > 200)
                             {
                                 // Old, discard
-                                this.droppedPackets++;
-                                //Console.WriteLine($"Age {sendData.Enqueued.Elapsed.TotalMilliseconds:N2}   queue length = {this.sendQueue.Count}   Dropped = {this.droppedPackets}");
+                                Interlocked.Increment(ref this.droppedPackets);
                                 continue;
                             }
                         }
 
                         long startTimestamp = Stopwatch.GetTimestamp();
 
-                        // Send packet
-                        SendPacket(sendData, sendData.Data.Memory[..sendData.DataLength]);
+                        // Send packet on this shard's socket
+                        SendPacket(sendData, sendData.Data.Memory[..sendData.DataLength], senderIndex);
 
                         if (!sendData.Important)
                         {
@@ -264,11 +308,11 @@ namespace Haukcode.HighPerfComm
                             this.sendRecorder.RecordValue(elapsedTicks);
                         }
 
-                        this.totalPackets++;
+                        Interlocked.Increment(ref this.totalPackets);
 
                         // Successful send clears any pending fault state.
-                        this.lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
-                        this.firstSendFailureTimestamp = 0;
+                        Interlocked.Exchange(ref this.lastSuccessfulSendTimestamp, Stopwatch.GetTimestamp());
+                        Interlocked.Exchange(ref this.firstSendFailureTimestamp, 0);
                     }
                     catch (Exception ex)
                     {
@@ -277,15 +321,18 @@ namespace Haukcode.HighPerfComm
 
                         if (ex is System.Net.Sockets.SocketException)
                         {
-                            if (this.firstSendFailureTimestamp == 0)
-                                this.firstSendFailureTimestamp = Stopwatch.GetTimestamp();
+                            // CompareExchange, not a read-then-write: with several sender threads
+                            // failing at once (a NIC flap takes them all down together) only the
+                            // first should stamp the fault, or the fault window keeps restarting
+                            // and HasSustainedSendFailure never trips.
+                            Interlocked.CompareExchange(ref this.firstSendFailureTimestamp, Stopwatch.GetTimestamp(), 0);
 
                             // Throttle notifications so a persistent failure (e.g. the bound
                             // NIC went away after a network change) doesn't spam the log once
                             // per packet. The first failure is reported immediately.
-                            if (ElapsedMs(this.lastErrorEmitTimestamp) >= ErrorEmitThrottleMS)
+                            if (ElapsedMs(Interlocked.Read(ref this.lastErrorEmitTimestamp)) >= ErrorEmitThrottleMS)
                             {
-                                this.lastErrorEmitTimestamp = Stopwatch.GetTimestamp();
+                                Interlocked.Exchange(ref this.lastErrorEmitTimestamp, Stopwatch.GetTimestamp());
 
                                 this.errorSubject.OnNext(ex);
                             }
@@ -384,14 +431,24 @@ namespace Haukcode.HighPerfComm
                 this.sendDataPool.Enqueue(sendData);
         }
 
-        protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
+        /// <param name="shardKey">
+        /// Selects the sender shard. Packets sharing a key are guaranteed to go out on the same
+        /// thread and socket, in order — pass the universe id so a universe's sequence numbers
+        /// stay monotonic. Any stable key works; it is reduced modulo the shard count.
+        /// </param>
+        protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter, int shardKey = 0)
         {
+            var queue = this.sendQueues[ShardFor(shardKey)];
+
             if (!IsOperational)
             {
-                // Clear queue
-                while (this.sendQueue.Reader.TryRead(out var sendData))
+                // Clear every queue, not just this shard's — the client as a whole is down.
+                foreach (var q in this.sendQueues)
                 {
-                    sendData.Data?.Dispose();
+                    while (q.Reader.TryRead(out var sendData))
+                    {
+                        sendData.Data?.Dispose();
+                    }
                 }
 
                 return;
@@ -410,7 +467,7 @@ namespace Haukcode.HighPerfComm
 
             newSendData.StartAgeStopwatch();
 
-            if (this.sendQueue.Writer.TryWrite(newSendData))
+            if (queue.Writer.TryWrite(newSendData))
             {
                 Interlocked.Increment(ref this.queueItemCounter);
             }
@@ -418,7 +475,7 @@ namespace Haukcode.HighPerfComm
             {
                 if (important)
                 {
-                    await this.sendQueue.Writer.WriteAsync(newSendData);
+                    await queue.Writer.WriteAsync(newSendData);
 
                     Interlocked.Increment(ref this.queueItemCounter);
                 }
@@ -426,10 +483,22 @@ namespace Haukcode.HighPerfComm
                 {
                     // Discard, indicate queue full. Dispose the rented buffer and return the
                     // send-data object to the pool (it never reached the sender's finally).
-                    this.fullQueue++;
+                    Interlocked.Increment(ref this.fullQueue);
                     ReturnSendData(newSendData);
                 }
             }
+        }
+
+        /// <summary>
+        /// Map a shard key onto a sender index. Non-negative and stable, so a given universe
+        /// always lands on the same thread/socket.
+        /// </summary>
+        private int ShardFor(int shardKey)
+        {
+            if (this.senderCount == 1)
+                return 0;
+
+            return (int)((uint)shardKey % (uint)this.senderCount);
         }
 
         protected ValueTask SendImmediateAsync(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
@@ -450,9 +519,13 @@ namespace Haukcode.HighPerfComm
 
                 sendData.DataLength = packetLength;
 
-                SendPacket(sendData, memory.Memory[..packetLength]);
+                // Sent inline on the caller's thread, bypassing the shard queues entirely, so it
+                // uses shard 0's socket. UDP sockets are safe to send from any thread; this path
+                // is for one-off/immediate packets, not the sustained stream, so it does not
+                // contend meaningfully with the sender threads.
+                SendPacket(sendData, memory.Memory[..packetLength], 0);
 
-                this.totalPackets++;
+                Interlocked.Increment(ref this.totalPackets);
             }
             finally
             {
