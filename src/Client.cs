@@ -283,6 +283,17 @@ namespace Haukcode.HighPerfComm
 
                     try
                     {
+                        if (sendData.BarrierSignal != null)
+                        {
+                            // Barrier marker: this shard has now drained everything queued ahead of
+                            // the barrier. Signal and send nothing (there is no payload).
+                            var signal = sendData.BarrierSignal;
+                            sendData.BarrierSignal = null;
+                            signal.Signal();
+
+                            continue;
+                        }
+
                         if (!sendData.Important)
                         {
                             // Ignore the important packets when recording age, not relevant
@@ -294,6 +305,15 @@ namespace Haukcode.HighPerfComm
                                 Interlocked.Increment(ref this.droppedPackets);
                                 continue;
                             }
+                        }
+
+                        if (sendData.BarrierWait != null)
+                        {
+                            // Ordering barrier: hold this packet until every other shard has
+                            // reached its marker, so it cannot overtake DMX still queued
+                            // elsewhere. Bounded, so a wedged shard can't stall output forever.
+                            sendData.BarrierWait.Wait(BarrierTimeoutMS);
+                            sendData.BarrierWait = null;
                         }
 
                         long startTimestamp = Stopwatch.GetTimestamp();
@@ -425,6 +445,10 @@ namespace Haukcode.HighPerfComm
             sendData.Data?.Dispose();
             sendData.Data = null!;
 
+            // Never let barrier state leak into the next packet that rents this object.
+            sendData.BarrierSignal = null;
+            sendData.BarrierWait = null;
+
             // Bounded so a client whose factory never rents (its pool only ever fills) can't grow
             // the pool without limit.
             if (this.sendDataPool.Count < SendDataPoolCap)
@@ -488,6 +512,68 @@ namespace Haukcode.HighPerfComm
                 }
             }
         }
+
+        /// <summary>
+        /// Queue a packet that must not overtake anything already queued on any shard — E1.31 sync
+        /// and ArtSync, which have to follow the DMX frames they synchronize.
+        ///
+        /// With one shard the queue gives that ordering for free. With several, the packet would
+        /// otherwise be transmitted as soon as its own shard reached it, while a slower shard still
+        /// had DMX for the same frame pending — silently breaking synchronization. So push a marker
+        /// onto every other shard and have the packet's own sender wait until all of them are
+        /// reached. Only sender threads block; the caller queues and moves on, exactly as before.
+        /// </summary>
+        protected async ValueTask QueueBarrierPacket(int allocatePacketLength, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter, int shardKey = 0)
+        {
+            if (this.senderCount == 1)
+            {
+                // Single shard: FIFO already guarantees it follows everything queued before it.
+                await QueuePacket(allocatePacketLength, important: true, sendDataFactory, packetWriter, shardKey);
+
+                return;
+            }
+
+            if (!IsOperational)
+                return;
+
+            int targetShard = ShardFor(shardKey);
+            var countdown = new CountdownEvent(this.senderCount - 1);
+
+            for (int i = 0; i < this.senderCount; i++)
+            {
+                if (i == targetShard)
+                    continue;
+
+                var marker = sendDataFactory();
+                marker.Data = null!;
+                marker.DataLength = 0;
+                marker.Important = true;
+                marker.BarrierSignal = countdown;
+                marker.StartAgeStopwatch();
+
+                await this.sendQueues[i].Writer.WriteAsync(marker);
+
+                Interlocked.Increment(ref this.queueItemCounter);
+            }
+
+            var memory = this.memoryPool.Rent(allocatePacketLength);
+
+            var newSendData = sendDataFactory();
+
+            newSendData.Data = memory;
+            newSendData.Important = true;
+            newSendData.DataLength = packetWriter(memory.Memory);
+            newSendData.BarrierWait = countdown;
+            newSendData.StartAgeStopwatch();
+
+            await this.sendQueues[targetShard].Writer.WriteAsync(newSendData);
+
+            Interlocked.Increment(ref this.queueItemCounter);
+        }
+
+        // A wedged shard must not be able to stall output indefinitely; the sync goes out late
+        // rather than never.
+        private const int BarrierTimeoutMS = 200;
 
         /// <summary>
         /// Map a shard key onto a sender index. Non-negative and stable, so a given universe
