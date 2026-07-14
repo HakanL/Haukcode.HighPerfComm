@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO.Pipelines;
@@ -34,6 +35,13 @@ namespace Haukcode.HighPerfComm
         private readonly Thread sendThread;
         private readonly Stopwatch receiveClock = new Stopwatch();
         private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
+
+        // Pool of spent TSendData objects so the hot send path doesn't allocate a new one per
+        // packet (~30k/s at the throughput ceiling). SPSC: the sender thread returns objects
+        // after transmit; the (single) queue-writer thread rents via RentSendData. Bounded so a
+        // client whose factory doesn't rent (leaves the pool filling) can't grow it without limit.
+        private readonly ConcurrentQueue<TSendData> sendDataPool = new();
+        private const int SendDataPoolCap = 2048;
         private long objectsFromPipeline;
         private long objectsIntoChannel;
         private Pipe? receivePipeline;
@@ -293,8 +301,8 @@ namespace Haukcode.HighPerfComm
                     }
                     finally
                     {
-                        // Return to pool
-                        sendData.Data?.Dispose();
+                        // Dispose the buffer and return the send-data object to the pool for reuse.
+                        ReturnSendData(sendData);
                     }
                 }
             }
@@ -354,6 +362,28 @@ namespace Haukcode.HighPerfComm
             this.receivePipeline = null;
         }
 
+        /// <summary>
+        /// Rent a spent send-data object from the pool, or null when the pool is empty (the
+        /// caller's factory then allocates a fresh one). Every field must be reconfigured before
+        /// use — a returned object is cleared of its buffer only. Called from the single
+        /// queue-writer thread.
+        /// </summary>
+        protected TSendData? RentSendData()
+        {
+            return this.sendDataPool.TryDequeue(out var sendData) ? sendData : null;
+        }
+
+        private void ReturnSendData(TSendData sendData)
+        {
+            sendData.Data?.Dispose();
+            sendData.Data = null!;
+
+            // Bounded so a client whose factory never rents (its pool only ever fills) can't grow
+            // the pool without limit.
+            if (this.sendDataPool.Count < SendDataPoolCap)
+                this.sendDataPool.Enqueue(sendData);
+        }
+
         protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter)
         {
             if (!IsOperational)
@@ -394,8 +424,10 @@ namespace Haukcode.HighPerfComm
                 }
                 else
                 {
-                    // Discard, indicate queue full
+                    // Discard, indicate queue full. Dispose the rented buffer and return the
+                    // send-data object to the pool (it never reached the sender's finally).
                     this.fullQueue++;
+                    ReturnSendData(newSendData);
                 }
             }
         }
