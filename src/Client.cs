@@ -43,7 +43,11 @@ namespace Haukcode.HighPerfComm
         private Thread? receiveThread;
         private Task? parserTask;
         private readonly Stopwatch receiveClock = new Stopwatch();
-        private readonly MemoryPool<byte> memoryPool = MemoryPool<byte>.Shared;
+
+        // Fixed-size pool sized to the largest packet this client handles; see FixedSizeMemoryPool
+        // for why MemoryPool<byte>.Shared misses under queue depth. Initialized in the constructor
+        // once the buffer size is known.
+        private readonly MemoryPool<byte> memoryPool;
 
         // Pool of spent TSendData objects so the hot send path doesn't allocate a new one per
         // packet (tens of thousands per second at the throughput ceiling). Multi-producer now that
@@ -84,6 +88,10 @@ namespace Haukcode.HighPerfComm
             this.senderCount = senderCount;
             this.sendQueues = new Channel<TSendData>[senderCount];
             this.sendThreads = new Thread[senderCount];
+
+            // Sized so every send-queue slot can hold a pooled buffer at once (plus receive-side
+            // slack); memory is only retained if that in-flight depth is actually reached.
+            this.memoryPool = new FixedSizeMemoryPool(this.receiveBufferSize, maxPooled: senderCount * 10_000 + 4_096);
 
             for (int i = 0; i < senderCount; i++)
             {
