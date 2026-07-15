@@ -44,6 +44,11 @@ namespace Haukcode.HighPerfComm
         private Task? parserTask;
         private readonly Stopwatch receiveClock = new Stopwatch();
 
+        // Anchor between the kernel timestamp clock and receiveClock, established on the
+        // first kernel-stamped packet after each StartReceive (0 = not yet anchored)
+        private long kernelTimestampBaseNS;
+        private long kernelTimestampBaseTicks;
+
         // Fixed-size pool sized to the largest packet this client handles; see FixedSizeMemoryPool
         // for why MemoryPool<byte>.Shared misses under queue depth. Initialized in the constructor
         // once the buffer size is known.
@@ -166,6 +171,15 @@ namespace Haukcode.HighPerfComm
         /// the pool is saturated, which corrupted recorded timestamps (gap-then-burst).
         /// </summary>
         protected abstract int ReceiveData(Memory<byte> memory, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
+
+        /// <summary>
+        /// Kernel arrival timestamp (CLOCK_REALTIME nanoseconds) of the packet just returned
+        /// by ReceiveData, or 0 when unavailable. Set by implementations that use kernel
+        /// receive timestamping (see LinuxReceiveTimestamping); cleared by the receive loop
+        /// before every ReceiveData call. When present it replaces the user-space timestamp,
+        /// so packets that waited in the socket buffer keep their true arrival times.
+        /// </summary>
+        protected long KernelReceiveTimestampNS { get; set; }
 
         /// <summary>
         /// Blocking send of a single packet. Called on the dedicated send thread (and from
@@ -412,6 +426,7 @@ namespace Haukcode.HighPerfComm
             this.receiveThread.Start();
 
             this.receiveClock.Restart();
+            this.kernelTimestampBaseNS = 0;
         }
 
         private void StopReceive()
@@ -715,10 +730,31 @@ namespace Haukcode.HighPerfComm
                 {
                     Memory<byte> memory = writer.GetMemory(this.receiveBufferSize);
 
+                    KernelReceiveTimestampNS = 0;
+
                     int receivedBytes = ReceiveData(memory[HeaderDataSize..], out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
-                    // Capture the timestamp first so it's as accurate as possible
-                    long timestampTicks = this.receiveClock.ElapsedTicks;
+                    // Capture the timestamp first so it's as accurate as possible. When the
+                    // implementation supplied a kernel arrival timestamp, anchor the kernel
+                    // clock to the receive clock on the first stamped packet and carry exact
+                    // kernel deltas from there — the rest of the pipeline stays tick-based.
+                    long timestampTicks;
+                    long kernelNS = KernelReceiveTimestampNS;
+                    if (kernelNS != 0)
+                    {
+                        if (this.kernelTimestampBaseNS == 0)
+                        {
+                            this.kernelTimestampBaseNS = kernelNS;
+                            this.kernelTimestampBaseTicks = this.receiveClock.ElapsedTicks;
+                        }
+
+                        timestampTicks = this.kernelTimestampBaseTicks
+                            + (long)((kernelNS - this.kernelTimestampBaseNS) * (Stopwatch.Frequency / 1_000_000_000.0));
+                    }
+                    else
+                    {
+                        timestampTicks = this.receiveClock.ElapsedTicks;
+                    }
 
                     if (remoteEndPoint == null || destinationAddress == null ||
                         remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
