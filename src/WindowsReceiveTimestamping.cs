@@ -19,6 +19,17 @@ namespace Haukcode.HighPerfComm
     /// Instances are not thread-safe: one per receive loop, matching the dedicated receive
     /// thread in Client. TryCreate returns null on non-Windows and on Windows versions where
     /// the ioctl is unsupported, so callers fall back to the portable receive path.
+    ///
+    /// IMPORTANT: enabling the socket option alone is not enough on Windows. The stack only
+    /// fills the SO_TIMESTAMP value when the adapter's miniport driver has software
+    /// timestamping enabled (the *SoftwareTimestamp INF keyword, off by default on most
+    /// drivers; e.g. Set-NetAdapterAdvancedProperty -RegistryKeyword "*SoftwareTimestamp"
+    /// -RegistryValue 1 for RxAll); otherwise every control message carries zero and callers
+    /// keep their user-space timestamps via the per-packet zero fallback. This cannot be
+    /// detected up front — GetInterfaceActiveTimestampCapabilities returns ERROR_BAD_DRIVER
+    /// on common NICs (measured on an Intel I210) in both the enabled and disabled states —
+    /// so KernelTimestampsObserved reports the truth once traffic flows. Loopback traffic is
+    /// never stamped (it bypasses the miniport).
     /// </summary>
     public sealed unsafe class WindowsReceiveTimestamping : IReceiveTimestamping
     {
@@ -35,12 +46,6 @@ namespace Haukcode.HighPerfComm
         private const int SOCKET_ERROR = -1;
 
         private static readonly Guid WSARecvMsgGuid = new Guid(0xf689d7c8, 0x6f1f, 0x436b, 0x8a, 0x53, 0xe5, 0x4f, 0xe3, 0x51, 0xc3, 0x22);
-
-        [DllImport("iphlpapi.dll")]
-        private static extern int ConvertInterfaceIndexToLuid(uint interfaceIndex, ulong* interfaceLuid);
-
-        [DllImport("iphlpapi.dll")]
-        private static extern int GetInterfaceActiveTimestampCapabilities(ulong* interfaceLuid, byte* timestampCapabilities);
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall, SetLastError = true)]
         private delegate int WSARecvMsgDelegate(IntPtr socket, IntPtr msg, out uint bytesReceived, IntPtr overlapped, IntPtr completionRoutine);
@@ -97,15 +102,6 @@ namespace Haukcode.HighPerfComm
 
             try
             {
-                // Enabling the socket option is not enough on Windows: the SO_TIMESTAMP
-                // control message arrives with a ZERO value unless the adapter's miniport
-                // driver has software timestamping enabled (the *SoftwareTimestamp INF
-                // keyword — off by default on most drivers). Decline here when no adapter
-                // stamps received packets so callers report the honest user-space path
-                // instead of claiming kernel timestamps that never materialize.
-                if (!AnyAdapterStampsReceivedPackets())
-                    return null;
-
                 // TIMESTAMPING_CONFIG { ULONG Flags; USHORT TxTimestampsBuffered; }
                 var config = new byte[8];
                 BinaryPrimitives.WriteUInt32LittleEndian(config, TIMESTAMPING_FLAG_RX);
@@ -132,58 +128,10 @@ namespace Haukcode.HighPerfComm
         }
 
         /// <summary>
-        /// True when at least one up, non-loopback adapter has SOFTWARE receive timestamping
-        /// active (INTERFACE_TIMESTAMP_CAPABILITIES.SoftwareCapabilities.AllReceive). Hardware
-        /// timestamping deliberately does not qualify: those stamps use the NIC's own clock,
-        /// not QPC, so this class could not convert them. If the capability API is missing
-        /// (Windows 10 before build 20348) this returns true and per-packet zero-timestamp
-        /// fallback in the caller covers the difference.
+        /// True once at least one received packet carried a nonzero kernel timestamp.
+        /// See IReceiveTimestamping.KernelTimestampsObserved.
         /// </summary>
-        private static bool AnyAdapterStampsReceivedPackets()
-        {
-            try
-            {
-                byte* capabilities = stackalloc byte[32];
-
-                foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up
-                        || nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
-                        continue;
-
-                    uint index;
-                    try
-                    {
-                        index = (uint)nic.GetIPProperties().GetIPv4Properties().Index;
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-
-                    ulong luid;
-                    if (ConvertInterfaceIndexToLuid(index, &luid) != 0)
-                        continue;
-
-                    // INTERFACE_TIMESTAMP_CAPABILITIES: ULONG64 HardwareClockFrequencyHz,
-                    // BOOLEAN SupportsCrossTimestamp, 11 hardware BOOLEANs, then
-                    // SoftwareCapabilities { AllReceive, AllTransmit, TaggedTransmit } —
-                    // software AllReceive is at byte offset 20
-                    if (GetInterfaceActiveTimestampCapabilities(&luid, capabilities) == 0 && capabilities[20] != 0)
-                        return true;
-                }
-
-                return false;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                return true;
-            }
-            catch (DllNotFoundException)
-            {
-                return true;
-            }
-        }
+        public bool KernelTimestampsObserved { get; private set; }
 
         public int Receive(ArraySegment<byte> buffer, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress, out long kernelTimestampNS)
         {
@@ -240,6 +188,9 @@ namespace Haukcode.HighPerfComm
                 throw new SocketException(errorCode);
 
             ParseControlMessages(controlLen, out kernelTimestampNS, out destinationAddress);
+            if (kernelTimestampNS != 0)
+                KernelTimestampsObserved = true;
+
             remoteEndPoint = ParseSourceEndPoint(nameLen);
 
             return (int)received;

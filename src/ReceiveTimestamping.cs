@@ -21,6 +21,18 @@ namespace Haukcode.HighPerfComm
         /// Socket.ReceiveMessageFrom.
         /// </summary>
         int Receive(ArraySegment<byte> buffer, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress, out long kernelTimestampNS);
+
+        /// <summary>
+        /// True once at least one received packet actually carried a kernel timestamp.
+        /// On Linux and macOS a successful setsockopt means stamps flow, so this turns
+        /// true on the first packet. On Windows the socket option alone is not enough —
+        /// the adapter's miniport driver must have software timestamping enabled (the
+        /// *SoftwareTimestamp INF keyword, off by default on most drivers) or every
+        /// SO_TIMESTAMP control message carries zero; this property is the reliable,
+        /// after-the-fact signal of which case applies (the driver capability APIs are
+        /// not trustworthy: common NICs return ERROR_BAD_DRIVER in both states).
+        /// </summary>
+        bool KernelTimestampsObserved { get; }
     }
 
     public static class ReceiveTimestamping

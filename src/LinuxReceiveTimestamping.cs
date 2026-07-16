@@ -99,6 +99,12 @@ namespace Haukcode.HighPerfComm
         }
 
         /// <summary>
+        /// True once at least one received packet carried a nonzero kernel timestamp.
+        /// See IReceiveTimestamping.KernelTimestampsObserved.
+        /// </summary>
+        public bool KernelTimestampsObserved { get; private set; }
+
+        /// <summary>
         /// Blocking receive. Returns the received byte count; kernelTimestampNS is the
         /// CLOCK_REALTIME arrival time in nanoseconds, or 0 when the kernel did not attach one.
         /// Throws SocketException on socket errors, matching Socket.ReceiveMessageFrom.
@@ -154,6 +160,9 @@ namespace Haukcode.HighPerfComm
                 throw new SocketException(errorCode);
 
             ParseControlMessages(controlLen, out kernelTimestampNS, out destinationAddress);
+            if (kernelTimestampNS != 0)
+                KernelTimestampsObserved = true;
+
             remoteEndPoint = ParseSourceEndPoint(nameLen);
 
             return (int)received;
