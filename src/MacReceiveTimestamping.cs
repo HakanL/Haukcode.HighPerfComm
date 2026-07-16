@@ -8,26 +8,26 @@ using System.Runtime.InteropServices;
 namespace Haukcode.HighPerfComm
 {
     /// <summary>
-    /// Linux kernel receive timestamping (SO_TIMESTAMPNS): every datagram is stamped when it
-    /// enters the network stack from the driver, so time spent waiting in the socket buffer
-    /// (because the process was descheduled, paused by the GC, or simply behind) no longer
-    /// distorts receive timestamps — a packet that waited 400 ms still carries its true
-    /// arrival time. Replaces Socket.ReceiveMessageFrom with a raw recvmsg call because the
-    /// timestamp arrives as a control message and .NET's Socket API does not surface those.
+    /// macOS kernel receive timestamping (SO_TIMESTAMP): every datagram is stamped when it
+    /// enters the network stack, so time spent waiting in the socket buffer no longer
+    /// distorts receive timestamps. The timestamp arrives as a SCM_TIMESTAMP control message
+    /// (a timeval, microsecond resolution), which .NET's Socket API does not surface, so
+    /// this replaces Socket.ReceiveMessageFrom with a raw recvmsg call.
     ///
     /// Instances are not thread-safe: one per receive loop, matching the dedicated receive
-    /// thread in Client. Layout assumptions: little-endian 64-bit Linux with a glibc msghdr
-    /// (size_t msg_iovlen), which holds for every Linux target we ship on (Debian/balena
-    /// arm64 and x64). TryCreate returns null anywhere else, so callers fall back to the
-    /// portable receive path with user-space timestamps.
+    /// thread in Client. Layout assumptions: 64-bit little-endian Darwin (msghdr with 32-bit
+    /// lengths, 4-byte-aligned cmsghdr entries, sockaddr_in with sin_len/sin_family bytes),
+    /// which holds for every macOS target we ship on (x64 and arm64). TryCreate returns null
+    /// anywhere else, so callers fall back to the portable receive path.
     /// </summary>
-    public sealed unsafe class LinuxReceiveTimestamping : IReceiveTimestamping
+    public sealed unsafe class MacReceiveTimestamping : IReceiveTimestamping
     {
-        private const int SOL_SOCKET = 1;
-        private const int SO_TIMESTAMPNS = 35;      // SO_TIMESTAMPNS_OLD: 64-bit time_t timespec on arm64/x64
+        private const int SOL_SOCKET = 0xffff;
+        private const int SO_TIMESTAMP = 0x0400;
+        private const int SCM_TIMESTAMP = 0x02;
         private const int IPPROTO_IP = 0;
-        private const int IP_PKTINFO = 8;
-        private const ushort AF_INET = 2;
+        private const int IP_PKTINFO = 26;      // also IP_RECVPKTINFO; same value enables and tags
+        private const byte AF_INET = 2;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct IoVec
@@ -36,15 +36,17 @@ namespace Haukcode.HighPerfComm
             public UIntPtr Length;
         }
 
+        // Darwin msghdr: msg_namelen and msg_controllen are socklen_t (32-bit) and
+        // msg_iovlen is int, each followed by padding on 64-bit — different from glibc
         [StructLayout(LayoutKind.Sequential)]
         private struct MsgHdr
         {
             public IntPtr Name;
             public uint NameLen;
             public IntPtr Iov;
-            public UIntPtr IovLen;
+            public int IovLen;
             public IntPtr Control;
-            public UIntPtr ControlLen;
+            public uint ControlLen;
             public int Flags;
         }
 
@@ -65,32 +67,34 @@ namespace Haukcode.HighPerfComm
         private readonly Dictionary<uint, IPAddress> addressCache = new();
         private const int MaxCacheEntries = 4096;
 
-        private LinuxReceiveTimestamping(Socket socket)
+        private MacReceiveTimestamping(Socket socket)
         {
             this.socket = socket;
         }
 
         /// <summary>
         /// Enable kernel receive timestamps on the socket. Returns null when unavailable
-        /// (not Linux, or the kernel refused the option) — callers then use their portable
+        /// (not macOS, or the kernel refused the option) — callers then use their portable
         /// receive path unchanged.
         /// </summary>
-        public static LinuxReceiveTimestamping? TryCreate(Socket socket)
+        public static MacReceiveTimestamping? TryCreate(Socket socket)
         {
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX) || IntPtr.Size != 8)
                 return null;
 
             try
             {
                 int enable = 1;
-                if (setsockopt(socket.Handle, SOL_SOCKET, SO_TIMESTAMPNS, &enable, sizeof(int)) != 0)
+                if (setsockopt(socket.Handle, SOL_SOCKET, SO_TIMESTAMP, &enable, sizeof(int)) != 0)
                     return null;
 
-                // The kernel only attaches the destination-address control message when packet
-                // info is enabled (ReceiveMessageFrom normally turns this on lazily)
-                socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
+                // The kernel only attaches the destination-address control message when
+                // packet info is enabled; set it through libc directly so we do not depend
+                // on how the runtime maps SocketOptionName on this platform
+                if (setsockopt(socket.Handle, IPPROTO_IP, IP_PKTINFO, &enable, sizeof(int)) != 0)
+                    return null;
 
-                return new LinuxReceiveTimestamping(socket);
+                return new MacReceiveTimestamping(socket);
             }
             catch
             {
@@ -98,11 +102,6 @@ namespace Haukcode.HighPerfComm
             }
         }
 
-        /// <summary>
-        /// Blocking receive. Returns the received byte count; kernelTimestampNS is the
-        /// CLOCK_REALTIME arrival time in nanoseconds, or 0 when the kernel did not attach one.
-        /// Throws SocketException on socket errors, matching Socket.ReceiveMessageFrom.
-        /// </summary>
         public int Receive(ArraySegment<byte> buffer, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress, out long kernelTimestampNS)
         {
             remoteEndPoint = null;
@@ -129,9 +128,9 @@ namespace Haukcode.HighPerfComm
                     Name = (IntPtr)namePtr,
                     NameLen = (uint)this.nameBuffer.Length,
                     Iov = (IntPtr)(&ioVec),
-                    IovLen = (UIntPtr)1,
+                    IovLen = 1,
                     Control = (IntPtr)controlPtr,
-                    ControlLen = (UIntPtr)this.controlBuffer.Length,
+                    ControlLen = (uint)this.controlBuffer.Length,
                     Flags = 0
                 };
 
@@ -167,34 +166,34 @@ namespace Haukcode.HighPerfComm
             var control = this.controlBuffer.AsSpan();
             int offset = 0;
 
-            // cmsghdr on 64-bit: size_t cmsg_len, int cmsg_level, int cmsg_type, then data;
-            // entries are aligned to 8 bytes
-            while (offset + 16 <= controlLen)
+            // Darwin cmsghdr: socklen_t cmsg_len (32-bit), int cmsg_level, int cmsg_type,
+            // then data; entries are aligned to 4 bytes (__DARWIN_ALIGN32)
+            while (offset + 12 <= controlLen)
             {
-                long cmsgLen = BinaryPrimitives.ReadInt64LittleEndian(control[offset..]);
-                if (cmsgLen < 16 || offset + cmsgLen > controlLen)
+                int cmsgLen = BinaryPrimitives.ReadInt32LittleEndian(control[offset..]);
+                if (cmsgLen < 12 || offset + cmsgLen > controlLen)
                     break;
 
-                int level = BinaryPrimitives.ReadInt32LittleEndian(control[(offset + 8)..]);
-                int type = BinaryPrimitives.ReadInt32LittleEndian(control[(offset + 12)..]);
-                var data = control[(offset + 16)..];
+                int level = BinaryPrimitives.ReadInt32LittleEndian(control[(offset + 4)..]);
+                int type = BinaryPrimitives.ReadInt32LittleEndian(control[(offset + 8)..]);
+                var data = control[(offset + 12)..];
 
-                if (level == SOL_SOCKET && type == SO_TIMESTAMPNS && cmsgLen >= 16 + 16)
+                if (level == SOL_SOCKET && type == SCM_TIMESTAMP && cmsgLen >= 12 + 12)
                 {
-                    // struct timespec { long tv_sec; long tv_nsec; }
+                    // struct timeval { long tv_sec; int tv_usec; } — microsecond resolution
                     long seconds = BinaryPrimitives.ReadInt64LittleEndian(data);
-                    long nanoseconds = BinaryPrimitives.ReadInt64LittleEndian(data[8..]);
-                    kernelTimestampNS = seconds * 1_000_000_000 + nanoseconds;
+                    int microseconds = BinaryPrimitives.ReadInt32LittleEndian(data[8..]);
+                    kernelTimestampNS = seconds * 1_000_000_000 + microseconds * 1_000L;
                 }
-                else if (level == IPPROTO_IP && type == IP_PKTINFO && cmsgLen >= 16 + 12)
+                else if (level == IPPROTO_IP && type == IP_PKTINFO && cmsgLen >= 12 + 12)
                 {
-                    // struct in_pktinfo { int ipi_ifindex; in_addr ipi_spec_dst; in_addr ipi_addr; }
-                    // ipi_addr is the header destination address
+                    // struct in_pktinfo { unsigned int ipi_ifindex; in_addr ipi_spec_dst;
+                    // in_addr ipi_addr; } — ipi_addr is the header destination address
                     uint networkOrderAddress = BinaryPrimitives.ReadUInt32LittleEndian(data[8..]);
                     destinationAddress = GetCachedAddress(networkOrderAddress);
                 }
 
-                offset += (int)((cmsgLen + 7) & ~7L);
+                offset += (cmsgLen + 3) & ~3;
             }
         }
 
@@ -205,7 +204,8 @@ namespace Haukcode.HighPerfComm
 
             var name = this.nameBuffer.AsSpan();
 
-            if (BinaryPrimitives.ReadUInt16LittleEndian(name) != AF_INET)
+            // BSD sockaddr_in: uint8 sin_len, uint8 sin_family, then port and address
+            if (name[1] != AF_INET)
                 return null;
 
             ushort port = BinaryPrimitives.ReadUInt16BigEndian(name[2..]);

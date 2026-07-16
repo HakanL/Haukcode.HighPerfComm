@@ -8,7 +8,7 @@
     <!-- Use modern C# syntax even on the netstandard2.1 leg (compiler-only features; no
          runtime/BCL dependency, so the target frameworks are unchanged). -->
     <LangVersion>latest</LangVersion>
-    <!-- LinuxReceiveTimestamping: raw recvmsg interop for kernel receive timestamps -->
+    <!-- Kernel receive timestamps: raw recvmsg/WSARecvMsg interop (Linux/Windows/macOS) -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Description>High Performance Communication Manager for packets</Description>
     <RepositoryUrl>https://github.com/HakanL/Haukcode.HighPerfComm</RepositoryUrl>

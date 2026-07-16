@@ -173,9 +173,10 @@ namespace Haukcode.HighPerfComm
         protected abstract int ReceiveData(Memory<byte> memory, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
         /// <summary>
-        /// Kernel arrival timestamp (CLOCK_REALTIME nanoseconds) of the packet just returned
-        /// by ReceiveData, or 0 when unavailable. Set by implementations that use kernel
-        /// receive timestamping (see LinuxReceiveTimestamping); cleared by the receive loop
+        /// Kernel arrival timestamp in nanoseconds (on a platform-specific clock; only deltas
+        /// are used) of the packet just returned by ReceiveData, or 0 when unavailable. Set by
+        /// implementations that use kernel receive timestamping (see
+        /// ReceiveTimestamping.TryCreate); cleared by the receive loop
         /// before every ReceiveData call. When present it replaces the user-space timestamp,
         /// so packets that waited in the socket buffer keep their true arrival times.
         /// </summary>
