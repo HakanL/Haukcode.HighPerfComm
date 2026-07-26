@@ -111,20 +111,27 @@ namespace Haukcode.HighPerfComm
                 });
             }
 
+            // WithThreadSafeWrites is required: the sender shards record concurrently, and the
+            // Recorder's phaser only guards the snapshot swap — writers enter the active
+            // histogram in parallel, so it must be the concurrent variant. Without it the
+            // counts silently corrupt and the interval snapshot's enumerator can throw
+            // ArgumentOutOfRangeException (TotalCount no longer matches the bucket sums).
             this.sendRecorder = HistogramFactory
-                .With64BitBucketSize()                  //LongHistogram
+                .With64BitBucketSize()                  //LongConcurrentHistogram
                 .WithValuesFrom(1)                      //Default value
                 .WithValuesUpTo(TimeStamp.Minutes(1))   //Default value
                 .WithPrecisionOf(3)                     //Default value
-                .WithThreadSafeReads()                  //returns a Recorder that wraps the LongConcurrentHistogram
+                .WithThreadSafeWrites()
+                .WithThreadSafeReads()                  //returns a Recorder
                 .Create();
 
             this.ageRecorder = HistogramFactory
-                .With64BitBucketSize()                  //LongHistogram
+                .With64BitBucketSize()                  //LongConcurrentHistogram
                 .WithValuesFrom(1)                      //Default value
                 .WithValuesUpTo(TimeStamp.Minutes(1))   //Default value
                 .WithPrecisionOf(3)                     //Default value
-                .WithThreadSafeReads()                  //returns a Recorder that wraps the LongConcurrentHistogram
+                .WithThreadSafeWrites()
+                .WithThreadSafeReads()                  //returns a Recorder
                 .Create();
 
             this.errorSubject = new Subject<Exception>();
