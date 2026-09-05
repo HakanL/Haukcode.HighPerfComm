@@ -40,14 +40,13 @@ namespace Haukcode.HighPerfComm
         private int fullQueue;
         private long totalPackets;
         protected readonly ISubject<Exception> errorSubject;
+        private readonly ISubject<KernelClockStep> kernelClockStepSubject = new Subject<KernelClockStep>();
         private Thread? receiveThread;
         private Task? parserTask;
         private readonly Stopwatch receiveClock = new Stopwatch();
 
-        // Anchor between the kernel timestamp clock and receiveClock, established on the
-        // first kernel-stamped packet after each StartReceive (0 = not yet anchored)
-        private long kernelTimestampBaseNS;
-        private long kernelTimestampBaseTicks;
+        // Maps kernel CLOCK_REALTIME stamps onto receiveClock, re-anchoring if NTP steps
+        private readonly KernelTimestampMapper kernelTimestampMapper = new KernelTimestampMapper();
 
         // Fixed-size pool sized to the largest packet this client handles; see FixedSizeMemoryPool
         // for why MemoryPool<byte>.Shared misses under queue depth. Initialized in the constructor
@@ -253,6 +252,12 @@ namespace Haukcode.HighPerfComm
 
         public IObservable<Exception> OnError => this.errorSubject.AsObservable();
 
+        /// <summary>
+        /// Fired when a kernel CLOCK_REALTIME step is absorbed so receive timestamps stay
+        /// monotonic. Silent to callers of the packet pipeline; subscribe to log it.
+        /// </summary>
+        public IObservable<KernelClockStep> OnKernelClockStep => this.kernelClockStepSubject.AsObservable();
+
         public SendStatistics GetSendStatistics(bool reset)
         {
             var sendStatsCopy = this.sendRecorder.GetIntervalHistogram();
@@ -407,6 +412,13 @@ namespace Haukcode.HighPerfComm
 
         public double ReceiveClock => this.receiveClock.Elapsed.TotalMilliseconds;
 
+        /// <summary>
+        /// Number of kernel-clock steps (NTP) absorbed since the last <see cref="StartReceive"/>.
+        /// Linux/macOS software timestamps are CLOCK_REALTIME and can jump; each jump is
+        /// dropped so the receive timeline stays continuous on the monotonic side.
+        /// </summary>
+        public int KernelClockSteps => this.kernelTimestampMapper.Steps;
+
         protected void StartReceive()
         {
             if (this.receiverCTS != null)
@@ -418,6 +430,11 @@ namespace Haukcode.HighPerfComm
             this.objectsIntoChannel = 0;
 
             this.receiverCTS = new CancellationTokenSource();
+
+            // Restart the clocks before the receive thread can dequeue a packet, otherwise
+            // the first stamp can land against a stale mapper state from a previous session.
+            this.receiveClock.Restart();
+            this.kernelTimestampMapper.Reset();
 
             // Run the receive loop on its own dedicated thread with blocking socket reads.
             // The kernel wakes the thread directly on packet arrival, so the packet-arrival
@@ -432,9 +449,6 @@ namespace Haukcode.HighPerfComm
                 Priority = ThreadPriority.AboveNormal
             };
             this.receiveThread.Start();
-
-            this.receiveClock.Restart();
-            this.kernelTimestampBaseNS = 0;
         }
 
         private void StopReceive()
@@ -742,22 +756,28 @@ namespace Haukcode.HighPerfComm
 
                     int receivedBytes = ReceiveData(memory[HeaderDataSize..], out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
-                    // Capture the timestamp first so it's as accurate as possible. When the
-                    // implementation supplied a kernel arrival timestamp, anchor the kernel
-                    // clock to the receive clock on the first stamped packet and carry exact
-                    // kernel deltas from there — the rest of the pipeline stays tick-based.
+                    // Capture the timestamp first so it's as accurate as possible. Kernel
+                    // stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto receiveClock;
+                    // NTP steps are absorbed so the output timeline stays monotonic.
                     long timestampTicks;
                     long kernelNS = KernelReceiveTimestampNS;
                     if (kernelNS != 0)
                     {
-                        if (this.kernelTimestampBaseNS == 0)
-                        {
-                            this.kernelTimestampBaseNS = kernelNS;
-                            this.kernelTimestampBaseTicks = this.receiveClock.ElapsedTicks;
-                        }
+                        var mapped = this.kernelTimestampMapper.Map(kernelNS, this.receiveClock.ElapsedTicks);
+                        timestampTicks = mapped.TimestampTicks;
 
-                        timestampTicks = this.kernelTimestampBaseTicks
-                            + (long)((kernelNS - this.kernelTimestampBaseNS) * (Stopwatch.Frequency / 1_000_000_000.0));
+                        if (mapped.Stepped)
+                        {
+                            try
+                            {
+                                this.kernelClockStepSubject.OnNext(new KernelClockStep(
+                                    mapped.Forward, mapped.KernelDeltaNS, mapped.MonotonicDeltaNS,
+                                    this.kernelTimestampMapper.Steps));
+                            }
+                            catch
+                            {
+                            }
+                        }
                     }
                     else
                     {

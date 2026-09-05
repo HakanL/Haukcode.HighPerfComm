@@ -107,6 +107,8 @@ namespace Haukcode.HighPerfComm
         /// <summary>
         /// Blocking receive. Returns the received byte count; kernelTimestampNS is the
         /// CLOCK_REALTIME arrival time in nanoseconds, or 0 when the kernel did not attach one.
+        /// CLOCK_REALTIME can step (NTP); Client maps stamps onto a monotonic Stopwatch and
+        /// re-anchors if they diverge, so a step does not inject a discontinuity into recordings.
         /// Throws SocketException on socket errors, matching Socket.ReceiveMessageFrom.
         /// </summary>
         public int Receive(ArraySegment<byte> buffer, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress, out long kernelTimestampNS)

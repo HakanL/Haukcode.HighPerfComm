@@ -48,7 +48,8 @@ jobs:
     - name: Build
       run: dotnet build --configuration Release --no-restore /p:Version="${PACKAGE_VERSION}"
     - name: Test
-      run: dotnet test --no-restore --verbosity normal
+      working-directory: test
+      run: dotnet test --verbosity normal
 
     ## Publish and Tag
     - name: Publish NuGet
