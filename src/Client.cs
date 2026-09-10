@@ -1,17 +1,14 @@
 ﻿using System;
 using System.Buffers;
-using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO.Pipelines;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 using HdrHistogram;
 
@@ -24,17 +21,27 @@ namespace Haukcode.HighPerfComm
         private readonly HdrHistogram.Recorder sendRecorder;
         private readonly HdrHistogram.Recorder ageRecorder;
 
+        // The interval histograms handed out by GetSendStatistics, recycled into the recorders on
+        // the next call. Without a recycle target every call allocated two fresh histograms, each
+        // carrying a bucket array of hundreds of KB (values up to a minute in Stopwatch ticks at
+        // three significant digits) -- large-object churn once a second per client, and gen2
+        // pressure on a box that is already short of GC headroom.
+        private HistogramBase? sendIntervalHistogram;
+        private HistogramBase? ageIntervalHistogram;
+
         // One queue + one dedicated thread + (in the derived client) one socket per sender shard.
         // A single sender thread is CPU-bound at ~20 us per packet on an RPi4 -- the cost is the
         // kernel's per-packet UDP/IP/multicast work, not syscall entry, so batching (sendmmsg)
         // only buys ~35% while sharding across cores scales ~2.4x on a 4-core box. Callers pick a
         // shard key (the universe id for DMX protocols); every packet with the same key lands on
         // the same thread and socket, which is what keeps per-universe sequence numbers ordered.
-        private readonly Channel<TSendData>[] sendQueues;
+        private readonly SendQueue[] sendQueues;
         private readonly Thread[] sendThreads;
         private readonly int senderCount;
 
         private readonly int receiveBufferSize;
+        private readonly Func<TPacketType, Task>? channelWriter;
+        private readonly Action? channelWriterComplete;
         private int queueItemCounter;
         private int droppedPackets;
         private int fullQueue;
@@ -42,7 +49,6 @@ namespace Haukcode.HighPerfComm
         protected readonly ISubject<Exception> errorSubject;
         private readonly ISubject<KernelClockStep> kernelClockStepSubject = new Subject<KernelClockStep>();
         private Thread? receiveThread;
-        private Task? parserTask;
         private readonly Stopwatch receiveClock = new Stopwatch();
 
         // Maps kernel CLOCK_REALTIME stamps onto receiveClock, re-anchoring if NTP steps
@@ -60,17 +66,10 @@ namespace Haukcode.HighPerfComm
         // doesn't rent (leaves the pool filling) can't grow it without limit.
         private readonly ConcurrentQueue<TSendData> sendDataPool = new();
         private const int SendDataPoolCap = 2048;
-        private long objectsFromPipeline;
-        private long objectsIntoChannel;
-        private Pipe? receivePipeline;
 
-        // Per-source/destination IP caches so the parse thread (the single-reader
-        // ParseFromPipeAsync consumer) doesn't allocate an IPEndPoint + two IPAddress objects
-        // on every received packet. Capped so a flood of spoofed source addresses can't grow
-        // them without bound. Only touched from GetSocketData on the parse thread.
-        private const int IpCacheCap = 512;
-        private readonly Dictionary<uint, IPAddress> ipAddressCache = new();
-        private readonly Dictionary<(uint Address, int Port), IPEndPoint> sourceEndPointCache = new();
+        // Unimportant packets past this many queued per shard are discarded (FullQueue);
+        // important ones always queue.
+        private const int SendQueueBound = 10_000;
 
         private long lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
         private long firstSendFailureTimestamp;
@@ -78,36 +77,129 @@ namespace Haukcode.HighPerfComm
         private const double SendFaultThresholdMS = 3_000;
         private const double ErrorEmitThrottleMS = 5_000;
 
+        /// <summary>
+        /// One sender shard's queue. A lock-free queue with a "consumer is asleep" flag instead
+        /// of a bounded Channel: the channel took a Monitor on every TryWrite and every TryRead,
+        /// and with the scheduler writing ~36,000 packets/s while three sender threads read,
+        /// that lock was contended on both sides (measured at 17 % of the scheduler thread's
+        /// time and ~5 % of each sender's on a CM4 at 600 universes / 60 Hz). Here the steady
+        /// state costs one interlocked enqueue/dequeue and no kernel wait; the event is only
+        /// touched when the sender has actually run dry.
+        /// </summary>
+        private sealed class SendQueue
+        {
+            private readonly ConcurrentQueue<TSendData> items = new();
+            private readonly ManualResetEventSlim signal = new(false);
+            private int count;
+            private int consumerWaiting;
+
+            public int Count => Volatile.Read(ref this.count);
+
+            public void Enqueue(TSendData item)
+            {
+                Interlocked.Increment(ref this.count);
+                this.items.Enqueue(item);
+
+                // Dekker-style handshake with the consumer: it publishes consumerWaiting and then
+                // re-checks the queue; we publish the item and then check the flag. A full fence
+                // on both sides keeps the two from missing each other on weakly ordered CPUs.
+                Interlocked.MemoryBarrier();
+
+                if (Volatile.Read(ref this.consumerWaiting) != 0)
+                    this.signal.Set();
+            }
+
+            public bool TryDequeue(out TSendData item)
+            {
+                if (this.items.TryDequeue(out item!))
+                {
+                    Interlocked.Decrement(ref this.count);
+
+                    return true;
+                }
+
+                return false;
+            }
+
+            /// <summary>
+            /// Dequeue, sleeping until an item arrives or the token is cancelled. Returns false only
+            /// on cancellation.
+            /// </summary>
+            public bool Take(out TSendData item, CancellationToken cancellationToken)
+            {
+                while (true)
+                {
+                    if (TryDequeue(out item))
+                        return true;
+
+                    Interlocked.Exchange(ref this.consumerWaiting, 1);
+
+                    if (TryDequeue(out item))
+                    {
+                        Volatile.Write(ref this.consumerWaiting, 0);
+
+                        return true;
+                    }
+
+                    try
+                    {
+                        this.signal.Wait(cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Volatile.Write(ref this.consumerWaiting, 0);
+
+                        return false;
+                    }
+
+                    this.signal.Reset();
+                    Volatile.Write(ref this.consumerWaiting, 0);
+                }
+            }
+
+            /// <summary>Wake a sleeping consumer without an item (shutdown).</summary>
+            public void Wake()
+            {
+                this.signal.Set();
+            }
+
+            public void Dispose()
+            {
+                this.signal.Dispose();
+            }
+        }
+
         /// <param name="senderCount">
         /// Number of sender shards (thread + queue + socket each). Defaults to 1, which is the
         /// original single-threaded behavior. Raise it to spread the kernel's per-packet send cost
         /// across cores when one sender thread saturates.
+        /// </param>
+        /// <param name="channelWriter">
+        /// Receives every parsed packet, on the receive thread, synchronously: the packet (and any
+        /// buffer slice it references) is only valid until the call returns, because the next
+        /// datagram is read into the same buffer. Copy what must be kept. A task that has not
+        /// completed when the call returns is waited for on the receive thread, which is the
+        /// backpressure: a stalled consumer leaves datagrams in the kernel socket buffer.
         /// </param>
         public Client(int packetSize, Func<TPacketType, Task>? channelWriter, Action? channelWriterComplete, int senderCount = 1)
         {
             if (senderCount < 1)
                 throw new ArgumentOutOfRangeException(nameof(senderCount));
 
-            this.receiveBufferSize = packetSize + HeaderDataSize;
+            this.receiveBufferSize = packetSize;
             this.senderCount = senderCount;
-            this.sendQueues = new Channel<TSendData>[senderCount];
+            this.channelWriter = channelWriter;
+            this.channelWriterComplete = channelWriterComplete;
+            this.sendQueues = new SendQueue[senderCount];
             this.sendThreads = new Thread[senderCount];
 
-            // Sized so every send-queue slot can hold a pooled buffer at once (plus receive-side
-            // slack); memory is only retained if that in-flight depth is actually reached.
-            this.memoryPool = new FixedSizeMemoryPool(this.receiveBufferSize, maxPooled: senderCount * 10_000 + 4_096);
+            // Sized so every send-queue slot can hold a pooled buffer at once (plus slack); memory
+            // is only retained if that in-flight depth is actually reached.
+            this.memoryPool = new FixedSizeMemoryPool(packetSize, maxPooled: senderCount * SendQueueBound + 4_096);
 
             for (int i = 0; i < senderCount; i++)
             {
-                // Each shard keeps the original bound, so total capacity scales with the shard
-                // count and one busy universe range can't starve another.
-                this.sendQueues[i] = Channel.CreateBounded<TSendData>(new BoundedChannelOptions(10_000)
-                {
-                    SingleReader = true,
-                    SingleWriter = true,
-                    AllowSynchronousContinuations = true,
-                    FullMode = BoundedChannelFullMode.Wait
-                });
+                this.sendQueues[i] = new SendQueue();
             }
 
             // WithThreadSafeWrites is required: the sender shards record concurrently, and the
@@ -153,19 +245,6 @@ namespace Haukcode.HighPerfComm
 
                 this.sendThreads[i].Start();
             }
-
-            this.receivePipeline = new Pipe(new PipeOptions(pauseWriterThreshold: 10_000_000));
-
-            if (channelWriter != null)
-            {
-                this.parserTask = Task.Factory.StartNew(async () =>
-                {
-                    // Parse and then call the transfomer to get our internal deconstructed data
-                    await ParseFromPipeAsync(this.receivePipeline.Reader, channelWriter, CancellationToken.None);
-
-                    channelWriterComplete?.Invoke();
-                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
-            }
         }
 
         /// <summary>
@@ -210,6 +289,12 @@ namespace Haukcode.HighPerfComm
 
         protected abstract void DisposeReceiveSocket();
 
+        /// <summary>
+        /// Parse one received datagram. Called on the receive thread; <paramref name="buffer"/> is
+        /// the receive buffer itself and is overwritten by the next datagram, so the returned
+        /// object may reference it only for as long as the channel writer holds it (see the
+        /// constructor). Return null to drop the packet.
+        /// </summary>
 #if NETSTANDARD2_1
         protected abstract TPacketType TryParseObject(ReadOnlyMemory<byte> buffer, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP);
 #else
@@ -241,12 +326,20 @@ namespace Haukcode.HighPerfComm
                 this.senderCTS.Cancel();
 
                 foreach (var queue in this.sendQueues)
-                    queue.Writer.Complete();
+                    queue.Wake();
 
                 StopReceive();
 
                 foreach (var thread in this.sendThreads)
                     thread.Join(5_000);
+
+                foreach (var queue in this.sendQueues)
+                {
+                    while (queue.TryDequeue(out var sendData))
+                        sendData.Data?.Dispose();
+
+                    queue.Dispose();
+                }
             }
         }
 
@@ -258,10 +351,17 @@ namespace Haukcode.HighPerfComm
         /// </summary>
         public IObservable<KernelClockStep> OnKernelClockStep => this.kernelClockStepSubject.AsObservable();
 
+        /// <summary>
+        /// Send statistics since the previous call. The histograms in the result are only valid
+        /// until the next call, which recycles them; copy (or <c>Add</c> into a cumulative
+        /// histogram) anything that must be kept.
+        /// </summary>
         public SendStatistics GetSendStatistics(bool reset)
         {
-            var sendStatsCopy = this.sendRecorder.GetIntervalHistogram();
-            var ageStatsCopy = this.ageRecorder.GetIntervalHistogram();
+            var sendStatsCopy = this.sendIntervalHistogram == null ? this.sendRecorder.GetIntervalHistogram() : this.sendRecorder.GetIntervalHistogram(this.sendIntervalHistogram);
+            var ageStatsCopy = this.ageIntervalHistogram == null ? this.ageRecorder.GetIntervalHistogram() : this.ageRecorder.GetIntervalHistogram(this.ageIntervalHistogram);
+            this.sendIntervalHistogram = sendStatsCopy;
+            this.ageIntervalHistogram = ageStatsCopy;
 
             var sendStatistics = new SendStatistics
             {
@@ -286,32 +386,23 @@ namespace Haukcode.HighPerfComm
 
         public ReceiveStatistics GetReceiveStatistics()
         {
-            long delta1 = Interlocked.Read(ref this.objectsFromPipeline) - Interlocked.Read(ref this.objectsIntoChannel);
-
-            var receiveStatistics = new ReceiveStatistics
+            // Packets are parsed and handed on by the receive thread itself, so nothing is ever
+            // queued between the socket and the channel writer.
+            return new ReceiveStatistics
             {
-                ObjectsInQueue1 = (int)delta1
+                ObjectsInQueue1 = 0
             };
-
-            return receiveStatistics;
         }
 
         private void Sender(int senderIndex)
         {
-            var reader = this.sendQueues[senderIndex].Reader;
+            var queue = this.sendQueues[senderIndex];
+            var token = this.senderCTS.Token;
 
-            while (!this.senderCTS.IsCancellationRequested)
+            while (!token.IsCancellationRequested)
             {
-                if (!reader.TryRead(out var sendData))
-                {
-                    // Block until data is available or the channel is completed. The waiter
-                    // is completed inline by the writer (AllowSynchronousContinuations), so
-                    // waking up doesn't depend on the thread pool.
-                    if (!reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult())
-                        break;
-
-                    continue;
-                }
+                if (!queue.Take(out var sendData, token))
+                    break;
 
                 {
                     Interlocked.Decrement(ref this.queueItemCounter);
@@ -434,9 +525,6 @@ namespace Haukcode.HighPerfComm
 
             InitializeReceiveSocket();
 
-            this.objectsFromPipeline = 0;
-            this.objectsIntoChannel = 0;
-
             this.receiverCTS = new CancellationTokenSource();
 
             // Restart the clocks before the receive thread can dequeue a packet, otherwise
@@ -469,17 +557,10 @@ namespace Haukcode.HighPerfComm
 
             this.receiveThread?.Join(5_000);
 
-            if (this.parserTask?.IsCanceled == false)
-                this.parserTask?.Wait(5_000);
-            this.parserTask?.Dispose();
-
             this.receiverCTS?.Dispose();
 
             this.receiveThread = null;
             this.receiverCTS = null;
-            this.parserTask = null;
-
-            this.receivePipeline = null;
         }
 
         /// <summary>
@@ -508,27 +589,33 @@ namespace Haukcode.HighPerfComm
                 this.sendDataPool.Enqueue(sendData);
         }
 
+        private void DiscardQueuedPackets()
+        {
+            // Clear every queue, not just this shard's — the client as a whole is down.
+            foreach (var q in this.sendQueues)
+            {
+                while (q.TryDequeue(out var sendData))
+                {
+                    Interlocked.Decrement(ref this.queueItemCounter);
+                    sendData.Data?.Dispose();
+                }
+            }
+        }
+
         /// <param name="shardKey">
         /// Selects the sender shard. Packets sharing a key are guaranteed to go out on the same
         /// thread and socket, in order — pass the universe id so a universe's sequence numbers
         /// stay monotonic. Any stable key works; it is reduced modulo the shard count.
         /// </param>
-        protected async ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter, int shardKey = 0)
+        protected ValueTask QueuePacket(int allocatePacketLength, bool important, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter, int shardKey = 0)
         {
             var queue = this.sendQueues[ShardFor(shardKey)];
 
             if (!IsOperational)
             {
-                // Clear every queue, not just this shard's — the client as a whole is down.
-                foreach (var q in this.sendQueues)
-                {
-                    while (q.Reader.TryRead(out var sendData))
-                    {
-                        sendData.Data?.Dispose();
-                    }
-                }
+                DiscardQueuedPackets();
 
-                return;
+                return default;
             }
 
             var memory = this.memoryPool.Rent(allocatePacketLength);
@@ -544,26 +631,20 @@ namespace Haukcode.HighPerfComm
 
             newSendData.StartAgeStopwatch();
 
-            if (queue.Writer.TryWrite(newSendData))
+            if (important || queue.Count < SendQueueBound)
             {
                 Interlocked.Increment(ref this.queueItemCounter);
+                queue.Enqueue(newSendData);
             }
             else
             {
-                if (important)
-                {
-                    await queue.Writer.WriteAsync(newSendData);
-
-                    Interlocked.Increment(ref this.queueItemCounter);
-                }
-                else
-                {
-                    // Discard, indicate queue full. Dispose the rented buffer and return the
-                    // send-data object to the pool (it never reached the sender's finally).
-                    Interlocked.Increment(ref this.fullQueue);
-                    ReturnSendData(newSendData);
-                }
+                // Discard, indicate queue full. Dispose the rented buffer and return the
+                // send-data object to the pool (it never reached the sender's finally).
+                Interlocked.Increment(ref this.fullQueue);
+                ReturnSendData(newSendData);
             }
+
+            return default;
         }
 
         /// <summary>
@@ -576,18 +657,16 @@ namespace Haukcode.HighPerfComm
         /// onto every other shard and have the packet's own sender wait until all of them are
         /// reached. Only sender threads block; the caller queues and moves on, exactly as before.
         /// </summary>
-        protected async ValueTask QueueBarrierPacket(int allocatePacketLength, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter, int shardKey = 0)
+        protected ValueTask QueueBarrierPacket(int allocatePacketLength, Func<TSendData> sendDataFactory, Func<Memory<byte>, int> packetWriter, int shardKey = 0)
         {
             if (this.senderCount == 1)
             {
                 // Single shard: FIFO already guarantees it follows everything queued before it.
-                await QueuePacket(allocatePacketLength, important: true, sendDataFactory, packetWriter, shardKey);
-
-                return;
+                return QueuePacket(allocatePacketLength, important: true, sendDataFactory, packetWriter, shardKey);
             }
 
             if (!IsOperational)
-                return;
+                return default;
 
             int targetShard = ShardFor(shardKey);
             var countdown = new CountdownEvent(this.senderCount - 1);
@@ -604,9 +683,8 @@ namespace Haukcode.HighPerfComm
                 marker.BarrierSignal = countdown;
                 marker.StartAgeStopwatch();
 
-                await this.sendQueues[i].Writer.WriteAsync(marker);
-
                 Interlocked.Increment(ref this.queueItemCounter);
+                this.sendQueues[i].Enqueue(marker);
             }
 
             var memory = this.memoryPool.Rent(allocatePacketLength);
@@ -619,9 +697,10 @@ namespace Haukcode.HighPerfComm
             newSendData.BarrierWait = countdown;
             newSendData.StartAgeStopwatch();
 
-            await this.sendQueues[targetShard].Writer.WriteAsync(newSendData);
-
             Interlocked.Increment(ref this.queueItemCounter);
+            this.sendQueues[targetShard].Enqueue(newSendData);
+
+            return default;
         }
 
         // A wedged shard must not be able to stall output indefinitely; the sync goes out late
@@ -674,125 +753,36 @@ namespace Haukcode.HighPerfComm
             return default;
         }
 
-        protected const int HeaderDataSize = 24;
-
-        private void WriteSocketDataToBuffer(int receivedBytes, long timestampTicks, IPEndPoint remoteEndPoint, IPAddress destAddress, Span<byte> buffer)
-        {
-            // Write the packet size
-            BinaryPrimitives.WriteInt32LittleEndian(buffer, receivedBytes);
-
-            int writePos = 4;
-            // Write timestamp
-            BinaryPrimitives.WriteInt64LittleEndian(buffer[writePos..], timestampTicks);
-            writePos += 8;
-
-            writePos += WriteIpAddress(buffer[writePos..], remoteEndPoint.Address);
-
-            // Socket port
-            BinaryPrimitives.WriteInt32LittleEndian(buffer[writePos..], remoteEndPoint.Port);
-            writePos += 4;
-
-            writePos += WriteIpAddress(buffer[writePos..], destAddress);
-
-#if DEBUG
-            if (writePos > HeaderDataSize)
-                throw new ArgumentOutOfRangeException("Invalid data");
-#endif
-        }
-
-        private int WriteIpAddress(Span<byte> buffer, IPAddress input)
-        {
-            byte[] sourceAddr = input.GetAddressBytes();
-            sourceAddr.CopyTo(buffer);
-
-            return sourceAddr.Length;
-        }
-
-        public void GetSocketData(ReadOnlySpan<byte> buffer, out int packetSize, out double timestampMS, out IPEndPoint source, out IPAddress destination)
-        {
-            packetSize = BinaryPrimitives.ReadInt32LittleEndian(buffer);
-
-            Debug.Assert(packetSize > 0 && packetSize < this.receiveBufferSize);
-
-            long timestampTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer.Slice(4));
-            timestampMS = (double)timestampTicks / Stopwatch.Frequency * 1000;
-
-            var sourceAddressBytes = buffer.Slice(12, 4);
-            uint sourceKey = BinaryPrimitives.ReadUInt32LittleEndian(sourceAddressBytes);
-            int sourcePort = BinaryPrimitives.ReadInt32LittleEndian(buffer.Slice(16, 4));
-
-            if (!this.sourceEndPointCache.TryGetValue((sourceKey, sourcePort), out var sourceEndPoint))
-            {
-                if (this.sourceEndPointCache.Count >= IpCacheCap)
-                    this.sourceEndPointCache.Clear();
-
-                sourceEndPoint = new IPEndPoint(GetCachedIpAddress(sourceKey, sourceAddressBytes), sourcePort);
-                this.sourceEndPointCache[(sourceKey, sourcePort)] = sourceEndPoint;
-            }
-
-            source = sourceEndPoint;
-
-            var destinationAddressBytes = buffer.Slice(20, 4);
-            destination = GetCachedIpAddress(BinaryPrimitives.ReadUInt32LittleEndian(destinationAddressBytes), destinationAddressBytes);
-        }
-
-        private IPAddress GetCachedIpAddress(uint key, ReadOnlySpan<byte> addressBytes)
-        {
-            if (!this.ipAddressCache.TryGetValue(key, out var address))
-            {
-                if (this.ipAddressCache.Count >= IpCacheCap)
-                    this.ipAddressCache.Clear();
-
-                address = new IPAddress(addressBytes);
-                this.ipAddressCache[key] = address;
-            }
-
-            return address;
-        }
-
+        /// <summary>
+        /// The receive loop: one blocking read, stamp, parse and hand-off per datagram, all on
+        /// this thread. Earlier versions copied each datagram into a System.IO.Pipelines pipe for
+        /// a separate parser task; at 36,000 packets/s that cost a Monitor acquisition per packet
+        /// on each side of the pipe (22 % of this thread's time went to lock contention on a CM4),
+        /// the parser hopped between thread-pool workers after every await, and every packet paid
+        /// a Task allocation. Parsing here needs none of that, and the kernel receive timestamp
+        /// keeps arrival times exact even when the consumer holds this thread up.
+        /// </summary>
         private void Receiver()
         {
-            var writer = this.receivePipeline!.Writer;
+            var buffer = new byte[this.receiveBufferSize];
+            var memory = new Memory<byte>(buffer);
 
             while (!this.receiverCTS!.IsCancellationRequested)
             {
                 try
                 {
-                    Memory<byte> memory = writer.GetMemory(this.receiveBufferSize);
-
                     KernelReceiveTimestampNS = 0;
 
-                    int receivedBytes = ReceiveData(memory[HeaderDataSize..], out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
+                    int receivedBytes = ReceiveData(memory, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
-                    // Read the monotonic clock first so it's as accurate as possible: it is
-                    // the user-space fallback timestamp, and the reference the kernel mapping
-                    // measures against. Both must mean "when this datagram was dequeued",
-                    // not "after the checks below had run".
-                    long monotonicTicks = this.receiveClock.ElapsedTicks;
-                    long kernelNS = KernelReceiveTimestampNS;
-
-                    if (remoteEndPoint == null || destinationAddress == null ||
-                        remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
-                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
-                    {
-                        // Missing or not IPv4
-                        continue;
-                    }
-
-                    if (receivedBytes <= 0)
-                        continue;
-
-                    // Only now, on a datagram that will actually reach the pipeline. A
-                    // dropped one must not move the receive timeline or count toward
-                    // reordering and clock-step detection: it is not part of the stream
-                    // being timestamped, and feeding it in reports steps for traffic the
-                    // caller never sees.
-                    // Kernel stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto
-                    // receiveClock; NTP steps are absorbed so the timeline stays monotonic.
+                    // Capture the timestamp first so it's as accurate as possible. Kernel
+                    // stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto receiveClock;
+                    // NTP steps are absorbed so the output timeline stays monotonic.
                     long timestampTicks;
+                    long kernelNS = KernelReceiveTimestampNS;
                     if (kernelNS != 0)
                     {
-                        var mapped = this.kernelTimestampMapper.Map(kernelNS, monotonicTicks);
+                        var mapped = this.kernelTimestampMapper.Map(kernelNS, this.receiveClock.ElapsedTicks);
                         timestampTicks = mapped.TimestampTicks;
 
                         if (mapped.Stepped)
@@ -810,23 +800,23 @@ namespace Haukcode.HighPerfComm
                     }
                     else
                     {
-                        timestampTicks = monotonicTicks;
+                        timestampTicks = this.receiveClock.ElapsedTicks;
                     }
 
-                    WriteSocketDataToBuffer(receivedBytes, timestampTicks, remoteEndPoint, destinationAddress, memory.Span);
+                    if (remoteEndPoint == null || destinationAddress == null ||
+                        remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
+                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
+                    {
+                        // Missing or not IPv4
+                        continue;
+                    }
 
-                    // Commit data to the pipe
-                    writer.Advance(receivedBytes + HeaderDataSize);
+                    if (receivedBytes > 0 && this.channelWriter != null)
+                    {
+                        double timestampMS = (double)timestampTicks / Stopwatch.Frequency * 1000;
 
-                    Interlocked.Increment(ref this.objectsFromPipeline);
-
-                    // Below the pause threshold this completes synchronously; if the parser
-                    // is far behind we block this thread, which is the desired backpressure.
-                    ValueTask<FlushResult> flushTask = writer.FlushAsync();
-                    FlushResult flushResult = flushTask.IsCompletedSuccessfully ? flushTask.Result : flushTask.AsTask().GetAwaiter().GetResult();
-
-                    if (flushResult.IsCompleted)
-                        break;
+                        DispatchPacket(memory[..receivedBytes], timestampMS, remoteEndPoint, destinationAddress);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -846,104 +836,29 @@ namespace Haukcode.HighPerfComm
                 }
             }
 
-            // Signal that writing is complete
-            writer.Complete();
+            this.channelWriterComplete?.Invoke();
         }
 
-        private async Task ParseFromPipeAsync(
-            PipeReader reader,
-            Func<TPacketType, Task> channelWriter,
-            CancellationToken cancellationToken)
+        private void DispatchPacket(ReadOnlyMemory<byte> data, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP)
         {
-            async Task processData(ReadOnlyMemory<byte> data, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP)
+            try
             {
-                try
+                var parsedObject = TryParseObject(data, timestampMS, sourceIP, destinationIP);
+                if (parsedObject != null)
                 {
-                    var parsedObject = TryParseObject(data, timestampMS, sourceIP, destinationIP);
-                    if (parsedObject != null)
-                    {
-                        Interlocked.Increment(ref this.objectsIntoChannel);
+                    var task = this.channelWriter!(parsedObject);
 
-                        await channelWriter(parsedObject);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    this.errorSubject.OnNext(ex);
+                    // Normally already completed (the consumer copies and returns). If it is not,
+                    // wait here: the buffer is about to be reused, and holding the receive thread
+                    // is the backpressure that keeps a stalled consumer from growing memory.
+                    if (!task.IsCompleted)
+                        task.GetAwaiter().GetResult();
                 }
             }
-
-            async Task<int> processBuffer(ReadOnlySequence<byte> buffer, int packetSize, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP)
+            catch (Exception ex)
             {
-                if (buffer.Length >= HeaderDataSize + packetSize)
-                {
-                    var packetSequence = buffer.Slice(HeaderDataSize, packetSize);
-
-                    if (packetSequence.IsSingleSegment)
-                    {
-                        await processData(packetSequence.First, timestampMS, sourceIP, destinationIP);
-                    }
-                    else
-                    {
-                        var copyBuf = this.memoryPool.Rent((int)packetSequence.Length);
-                        packetSequence.CopyTo(copyBuf.Memory.Span);
-
-                        await processData(copyBuf.Memory, timestampMS, sourceIP, destinationIP);
-
-                        copyBuf.Dispose();
-                    }
-
-                    return HeaderDataSize + packetSize;
-                }
-
-                return 0;
+                this.errorSubject.OnNext(ex);
             }
-
-            while (true)
-            {
-                ReadResult result = await reader.ReadAsync(cancellationToken);
-                ReadOnlySequence<byte> buffer = result.Buffer;
-
-                while (buffer.Length >= HeaderDataSize)
-                {
-                    // We have enough data to read the packet size and details
-                    ReadOnlySequence<byte> header = buffer.Slice(0, HeaderDataSize);
-
-                    int advanceBytes;
-                    if (header.IsSingleSegment)
-                    {
-                        GetSocketData(header.First.Span, out int packetSize, out double timestampMS, out IPEndPoint sourceIP, out IPAddress destinationIP);
-
-                        advanceBytes = await processBuffer(buffer, packetSize, timestampMS, sourceIP, destinationIP);
-                    }
-                    else
-                    {
-                        // Unlikely that we'll have multiple segments for 24 bytes, but could happen
-                        var copyBuf = this.memoryPool.Rent((int)header.Length);
-                        header.CopyTo(copyBuf.Memory.Span);
-
-                        GetSocketData(copyBuf.Memory.Span, out int packetSize, out double timestampMS, out IPEndPoint sourceIP, out IPAddress destinationIP);
-
-                        advanceBytes = await processBuffer(buffer, packetSize, timestampMS, sourceIP, destinationIP);
-
-                        copyBuf.Dispose();
-                    }
-
-                    if (advanceBytes == 0)
-                        // We don't have enough data yet
-                        break;
-
-                    buffer = buffer.Slice(advanceBytes); // Advance buffer
-                }
-
-                // Indicate consumed bytes
-                reader.AdvanceTo(buffer.Start, buffer.End);
-
-                if (result.IsCompleted)
-                    break;
-            }
-
-            await reader.CompleteAsync();
         }
     }
 }

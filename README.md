@@ -4,7 +4,7 @@ A high-performance .NET library for packet-based network communication with buil
 
 ## Features
 
-- **High Performance**: Built on modern .NET primitives including `System.IO.Pipelines`, `System.Threading.Channels`, and `System.Buffers` for maximum throughput and minimal allocations
+- **High Performance**: Lock-free send queues, a dedicated blocking thread per socket, and `System.Buffers` pooling for maximum throughput and minimal allocations
 - **Memory Efficient**: Uses `MemoryPool<byte>` for buffer management to reduce GC pressure
 - **Asynchronous**: Fully async/await pattern with cancellation support
 - **Statistics & Monitoring**: Built-in HDR histograms for tracking send/receive performance and queue metrics
@@ -171,18 +171,17 @@ Console.WriteLine($"Objects in queue: {receiveStats.ObjectsInQueue1}");
 ### Core Components
 
 1. **Client Base Class**: The abstract `Client<TSendData, TPacketType>` manages the lifecycle of send and receive operations
-2. **Send Pipeline**: Uses a bounded `Channel<TSendData>` with a dedicated sender task for non-blocking packet transmission
-3. **Receive Pipeline**: Uses `System.IO.Pipelines.Pipe` for efficient buffer management during packet reception
-4. **Parser Task**: Processes received data from the pipeline and transforms it into strongly-typed packet objects
+2. **Send Pipeline**: One lock-free queue plus a dedicated sender thread (and socket) per shard; the queue only touches a kernel event when a sender has actually run dry, so the steady state costs no lock on either side
+3. **Receive Pipeline**: A dedicated receive thread does the blocking read, stamps the packet, parses it with `TryParseObject()` and hands it to `channelWriter` — all inline, with no intermediate buffer or thread hop
 
 ### Data Flow
 
 ```
 Send Path:
-QueuePacket() → Channel → Sender Task → SendPacketAsync() → Network
+QueuePacket() → shard queue → Sender Thread → SendPacket() → Network
 
 Receive Path:
-Network → ReceiveData() → Pipe → Parser Task → TryParseObject() → channelWriter
+Network → ReceiveData() → TryParseObject() → channelWriter   (all on the receive thread)
 ```
 
 ## Advanced Features
@@ -262,9 +261,10 @@ Key parameters you can adjust:
 ```csharp
 // In the Client constructor:
 // - packetSize: Maximum packet size in bytes (buffer allocation size)
-// - Queue capacity: Default is 10,000 items (see Channel.CreateBounded in Client.cs)
+// - Queue capacity: 10,000 unimportant items per shard (SendQueueBound in Client.cs); important packets always queue
 // - Receive buffer: Set in InitializeReceiveSocket() (e.g., udpClient.Client.ReceiveBufferSize)
-// - Pipeline buffer: Default pause threshold is 10MB (see PipeOptions in Client.cs)
+// - Backpressure: a channelWriter task that has not completed is waited for on the receive
+//   thread, so a slow consumer leaves datagrams in the kernel socket buffer
 ```
 
 ## API Reference
@@ -278,8 +278,10 @@ Abstract base class for implementing packet-based communication.
 ```csharp
 protected Client(
     int packetSize,                      // Maximum packet size in bytes
-    Func<TPacketType, Task>? channelWriter,  // Callback for received packets
-    Action? channelWriterComplete        // Callback when receiver completes
+    Func<TPacketType, Task>? channelWriter,  // Callback for received packets, on the receive thread;
+                                             // the packet (and any buffer slice it references) is only
+                                             // valid until the callback returns — copy what you keep
+    Action? channelWriterComplete        // Callback when the receive loop ends
 )
 ```
 
@@ -364,8 +366,8 @@ public class SendStatistics
 ```csharp
 public class ReceiveStatistics
 {
-    public int ObjectsInQueue1 { get; set; }    // Objects waiting in pipeline
-    public int ObjectsInQueue2 { get; set; }    // Reserved for future use
+    public int ObjectsInQueue1 { get; set; }    // Always 0: packets are handed on by the receive thread itself
+    public int ObjectsInQueue2 { get; set; }    // Reserved for the consumer's own queue
 }
 ```
 
