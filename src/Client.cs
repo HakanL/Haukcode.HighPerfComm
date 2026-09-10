@@ -764,14 +764,35 @@ namespace Haukcode.HighPerfComm
 
                     int receivedBytes = ReceiveData(memory[HeaderDataSize..], out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
-                    // Capture the timestamp first so it's as accurate as possible. Kernel
-                    // stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto receiveClock;
-                    // NTP steps are absorbed so the output timeline stays monotonic.
-                    long timestampTicks;
+                    // Read the monotonic clock first so it's as accurate as possible: it is
+                    // the user-space fallback timestamp, and the reference the kernel mapping
+                    // measures against. Both must mean "when this datagram was dequeued",
+                    // not "after the checks below had run".
+                    long monotonicTicks = this.receiveClock.ElapsedTicks;
                     long kernelNS = KernelReceiveTimestampNS;
+
+                    if (remoteEndPoint == null || destinationAddress == null ||
+                        remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
+                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
+                    {
+                        // Missing or not IPv4
+                        continue;
+                    }
+
+                    if (receivedBytes <= 0)
+                        continue;
+
+                    // Only now, on a datagram that will actually reach the pipeline. A
+                    // dropped one must not move the receive timeline or count toward
+                    // reordering and clock-step detection: it is not part of the stream
+                    // being timestamped, and feeding it in reports steps for traffic the
+                    // caller never sees.
+                    // Kernel stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto
+                    // receiveClock; NTP steps are absorbed so the timeline stays monotonic.
+                    long timestampTicks;
                     if (kernelNS != 0)
                     {
-                        var mapped = this.kernelTimestampMapper.Map(kernelNS, this.receiveClock.ElapsedTicks);
+                        var mapped = this.kernelTimestampMapper.Map(kernelNS, monotonicTicks);
                         timestampTicks = mapped.TimestampTicks;
 
                         if (mapped.Stepped)
@@ -789,34 +810,23 @@ namespace Haukcode.HighPerfComm
                     }
                     else
                     {
-                        timestampTicks = this.receiveClock.ElapsedTicks;
+                        timestampTicks = monotonicTicks;
                     }
 
-                    if (remoteEndPoint == null || destinationAddress == null ||
-                        remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
-                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
-                    {
-                        // Missing or not IPv4
-                        continue;
-                    }
+                    WriteSocketDataToBuffer(receivedBytes, timestampTicks, remoteEndPoint, destinationAddress, memory.Span);
 
-                    if (receivedBytes > 0)
-                    {
-                        WriteSocketDataToBuffer(receivedBytes, timestampTicks, remoteEndPoint, destinationAddress, memory.Span);
+                    // Commit data to the pipe
+                    writer.Advance(receivedBytes + HeaderDataSize);
 
-                        // Commit data to the pipe
-                        writer.Advance(receivedBytes + HeaderDataSize);
+                    Interlocked.Increment(ref this.objectsFromPipeline);
 
-                        Interlocked.Increment(ref this.objectsFromPipeline);
+                    // Below the pause threshold this completes synchronously; if the parser
+                    // is far behind we block this thread, which is the desired backpressure.
+                    ValueTask<FlushResult> flushTask = writer.FlushAsync();
+                    FlushResult flushResult = flushTask.IsCompletedSuccessfully ? flushTask.Result : flushTask.AsTask().GetAwaiter().GetResult();
 
-                        // Below the pause threshold this completes synchronously; if the parser
-                        // is far behind we block this thread, which is the desired backpressure.
-                        ValueTask<FlushResult> flushTask = writer.FlushAsync();
-                        FlushResult flushResult = flushTask.IsCompletedSuccessfully ? flushTask.Result : flushTask.AsTask().GetAwaiter().GetResult();
-
-                        if (flushResult.IsCompleted)
-                            break;
-                    }
+                    if (flushResult.IsCompleted)
+                        break;
                 }
                 catch (Exception ex)
                 {
