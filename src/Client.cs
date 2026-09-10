@@ -782,14 +782,34 @@ namespace Haukcode.HighPerfComm
 
                     int receivedBytes = ReceiveData(memory, out IPEndPoint? remoteEndPoint, out IPAddress? destinationAddress);
 
-                    // Capture the timestamp first so it's as accurate as possible. Kernel
-                    // stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto receiveClock;
-                    // NTP steps are absorbed so the output timeline stays monotonic.
-                    long timestampTicks;
+                    // Read the monotonic clock first so it's as accurate as possible: it is
+                    // the user-space fallback timestamp, and the reference the kernel mapping
+                    // measures against. Both must mean "when this datagram was dequeued", not
+                    // "after the checks below had run".
+                    long monotonicTicks = this.receiveClock.ElapsedTicks;
                     long kernelNS = KernelReceiveTimestampNS;
+
+                    if (remoteEndPoint == null || destinationAddress == null ||
+                        remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
+                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
+                    {
+                        // Missing or not IPv4
+                        continue;
+                    }
+
+                    if (receivedBytes <= 0 || this.channelWriter == null)
+                        continue;
+
+                    // Only now, on a datagram that will actually be dispatched. A dropped one
+                    // must not move the receive timeline or count toward reordering and
+                    // clock-step detection: it is not part of the stream being timestamped,
+                    // and feeding it in reports steps for traffic the caller never sees.
+                    // Kernel stamps (CLOCK_REALTIME on Linux/macOS) are mapped onto
+                    // receiveClock; NTP steps are absorbed so the timeline stays monotonic.
+                    long timestampTicks;
                     if (kernelNS != 0)
                     {
-                        var mapped = this.kernelTimestampMapper.Map(kernelNS, this.receiveClock.ElapsedTicks);
+                        var mapped = this.kernelTimestampMapper.Map(kernelNS, monotonicTicks);
                         timestampTicks = mapped.TimestampTicks;
 
                         if (mapped.Stepped)
@@ -807,23 +827,12 @@ namespace Haukcode.HighPerfComm
                     }
                     else
                     {
-                        timestampTicks = this.receiveClock.ElapsedTicks;
+                        timestampTicks = monotonicTicks;
                     }
 
-                    if (remoteEndPoint == null || destinationAddress == null ||
-                        remoteEndPoint.AddressFamily != AddressFamily.InterNetwork ||
-                        destinationAddress.AddressFamily != AddressFamily.InterNetwork)
-                    {
-                        // Missing or not IPv4
-                        continue;
-                    }
+                    double timestampMS = (double)timestampTicks / Stopwatch.Frequency * 1000;
 
-                    if (receivedBytes > 0 && this.channelWriter != null)
-                    {
-                        double timestampMS = (double)timestampTicks / Stopwatch.Frequency * 1000;
-
-                        DispatchPacket(memory[..receivedBytes], timestampMS, remoteEndPoint, destinationAddress);
-                    }
+                    DispatchPacket(memory[..receivedBytes], timestampMS, remoteEndPoint, destinationAddress);
                 }
                 catch (Exception ex)
                 {
