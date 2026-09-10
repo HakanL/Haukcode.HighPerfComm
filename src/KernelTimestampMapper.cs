@@ -22,9 +22,9 @@ namespace Haukcode.HighPerfComm
     /// </item>
     /// <item>
     /// Backward step: the mapped tick would go backwards by more than
-    /// <see cref="ReorderToleranceNS"/>, or by less than that for longer than a reorder can
-    /// last (see <see cref="MaxConsecutiveReorders"/>). Queue delay never moves the mapped
-    /// tick backwards because kernel arrival times still increase; an NTP step-back does.
+    /// <see cref="ReorderToleranceNS"/>, or by less than that for longer than the tolerance
+    /// itself takes to undo. Queue delay never moves the mapped tick backwards because
+    /// kernel arrival times still increase; an NTP step-back does.
     /// </item>
     /// </list>
     /// A backward move *within* the tolerance is packet reordering, not a clock step: the
@@ -70,28 +70,9 @@ namespace Haukcode.HighPerfComm
         /// </summary>
         public const long ReorderToleranceNS = 10_000_000;
 
-        /// <summary>
-        /// Packet-count bound on a hold. Deliberately generous: a run of reordered packets
-        /// is not one or two, it is however many the NIC indicates in a batch. With RSS the
-        /// destination groups of a large sACN stream hash across receive queues, each queue
-        /// is drained by its own DPC on its own core, and interrupt moderation makes those
-        /// batches big — a measured Windows box (Intel I210, 2 RSS queues, *SoftwareTimestamp
-        /// RxAll) produced runs well past 8, which is what made an earlier cap of that size
-        /// report thousands of false steps.
-        /// </summary>
-        public const int MaxConsecutiveReorders = 32;
-
-        /// <summary>
-        /// Wall-clock bound on the same hold. Queue skew resolves in well under a
-        /// millisecond (measured: 99 % of holds under 0.5 ms, none over 2 ms that were not
-        /// genuine), while a real sub-tolerance step back holds until the clock catches up.
-        /// </summary>
-        public const long ReorderHoldLimitNS = 2_000_000;
-
         private readonly double ticksPerNanosecond;
         private readonly double nanosecondsPerTick;
         private readonly long reorderToleranceTicks;
-        private readonly long reorderHoldLimitTicks;
         private long baseNS;
         private long baseTicks;
         private long lastKernelNS;
@@ -100,7 +81,6 @@ namespace Haukcode.HighPerfComm
         private bool anchored;
         private int steps;
         private int reorders;
-        private int consecutiveReorders;
 
         /// <param name="stopwatchFrequency">
         /// Ticks per second of the monotonic clock. 0 (the default) uses
@@ -112,7 +92,6 @@ namespace Haukcode.HighPerfComm
             this.ticksPerNanosecond = frequency / 1_000_000_000.0;
             this.nanosecondsPerTick = 1_000_000_000.0 / frequency;
             this.reorderToleranceTicks = (long)(ReorderToleranceNS * this.ticksPerNanosecond);
-            this.reorderHoldLimitTicks = (long)(ReorderHoldLimitNS * this.ticksPerNanosecond);
         }
 
         /// <summary>
@@ -136,7 +115,6 @@ namespace Haukcode.HighPerfComm
             this.lastMonotonicTicks = 0;
             this.steps = 0;
             this.reorders = 0;
-            this.consecutiveReorders = 0;
         }
 
         /// <summary>
@@ -174,22 +152,23 @@ namespace Haukcode.HighPerfComm
                 // is and leave the anchor alone so the next in-order packet maps normally;
                 // re-anchoring here would throw away kernel precision on every reorder.
                 //
-                // Magnitude alone cannot tell the two apart, so persistence decides: queue
-                // skew resolves as soon as the lagging queue is drained, while a genuine
-                // sub-tolerance clock step leaves EVERY later packet behind. Holding through
-                // one of those would tie the whole recording to one timestamp until the clock
-                // caught up — at 36k packets/s an 8 ms step-back is ~290 tied frames.
+                // The hold needs only one bound, and the tolerance already is it. A backward
+                // move of at most ReorderToleranceNS cannot need longer than that to undo:
+                // the kernel clock keeps advancing at real time, so the deficit shrinks and
+                // is gone within its own size. A hold that outlives it is therefore not the
+                // reorder it looked like — the stream stopped, or something moved the clock
+                // further — and re-anchoring is right. Anything deeper than the tolerance was
+                // already classified as a step above, before reaching here.
                 //
-                // Both bounds must be exceeded, because each one alone misreads a different
-                // stream. A fast stream reorders in bulk but briefly, so the count says step
-                // and the clock says no. A slow stream reorders one packet across a whole
-                // frame period, so the clock says step and the count says no — and there a
-                // real step never opens a hold at all, since one frame gap already outruns
-                // it. Only a hold that is both long and deep is the real thing.
-                this.consecutiveReorders++;
-
-                if (this.consecutiveReorders <= MaxConsecutiveReorders ||
-                    monotonicTicks - this.lastMonotonicTicks <= this.reorderHoldLimitTicks)
+                // Nothing is counted, because the count is not the signal: a run of reordered
+                // packets is however many the NIC indicates in a batch. With RSS the
+                // destination groups hash across receive queues, each queue is drained by its
+                // own DPC on its own core, and interrupt moderation makes those batches big.
+                // Measured on an Intel I210 with 2 RSS queues, 600 universes at 60 Hz: holds
+                // of 2.0-2.8 ms, stamps 0.1-1.8 ms behind, and runs far past any small cap —
+                // while the same stream at 40 Hz never reorders at all, because the receive
+                // loop keeps up and no backlog forms for the queues to interleave inside.
+                if (monotonicTicks - this.lastMonotonicTicks <= this.reorderToleranceTicks)
                 {
                     this.reorders++;
 
@@ -198,8 +177,6 @@ namespace Haukcode.HighPerfComm
 
                 backwardStep = true;
             }
-
-            this.consecutiveReorders = 0;
 
             if (forwardStep || backwardStep)
             {

@@ -210,49 +210,53 @@ namespace Haukcode.HighPerfComm.Tests
             // The measured Windows shape: an Intel I210 with 2 RSS queues and software
             // timestamping, where a large sACN stream's destination groups hash across both
             // queues. One queue's moderated batch is indicated after the other's, so a long
-            // run of packets carries stamps a few hundred microseconds behind the high-water
-            // mark — 40 of them inside 0.3 ms, far past the packet-count bound but nowhere
-            // near the time bound. Not one of these may be reported as a clock step.
+            // run of packets carries stamps behind the high-water mark. Measured at 600
+            // universes / 60 Hz: holds of 2.0-2.8 ms, stamps 0.1-1.8 ms behind, runs far
+            // longer than 40. Not one of these may be reported as a clock step.
             long kernelNS = KernelOriginNS;
             mapper.Map(kernelNS, 0);
-            mapper.Map(kernelNS + Ms(0.4), Ms(0.01));
+            mapper.Map(kernelNS + Ms(1.8), Ms(0.01));
 
-            for (int i = 0; i < 40; i++)
+            for (int i = 0; i < 120; i++)
             {
-                mapper.Map(kernelNS + Ms(0.1 + i * 0.002), Ms(0.02 + i * 0.0075));
+                mapper.Map(kernelNS + Ms(0.1 + i * 0.014), Ms(0.02 + i * 0.023));
             }
 
             Assert.Equal(0, mapper.Steps);
-            Assert.Equal(40, mapper.Reorders);
+            Assert.Equal(120, mapper.Reorders);
         }
 
         [Fact]
-        public void SlowStreamReorder_SpanningAFramePeriod_IsNotAStep()
+        public void SlowStreamReorder_OutlivingTheTolerance_IsReclassified()
         {
             var mapper = CreateMapper();
 
-            // A handful of universes at 40 Hz: an isolated swap holds across a whole 25 ms
-            // frame, which is well past the time bound but only one packet deep. The count
-            // bound has to save it — on a stream this slow a real sub-tolerance step never
-            // opens a hold at all, because one frame gap already outruns it.
+            // A handful of universes at 40 Hz. An isolated swap holds across a whole 25 ms
+            // frame, which outlives the tolerance, so this one IS reclassified — and that is
+            // correct: on a stream this slow the swap is indistinguishable from the clock
+            // having moved, and re-anchoring costs nothing because the next packet maps by
+            // its own kernel delta either way.
             long kernelNS = KernelOriginNS;
             mapper.Map(kernelNS, 0);
             mapper.Map(kernelNS + Ms(25), Ms(25));
             var result = mapper.Map(kernelNS + Ms(24.9), Ms(50));
 
-            Assert.False(result.Stepped);
-            Assert.Equal(0, mapper.Steps);
-            Assert.Equal(1, mapper.Reorders);
+            Assert.True(result.Stepped);
+            Assert.Equal(1, mapper.Steps);
+            Assert.Equal(Ms(50), result.TimestampTicks);
         }
 
         [Fact]
-        public void SubToleranceBackwardStep_HoldsTheTimelineBriefly_ThenResumes()
+        public void SubToleranceBackwardStep_IsAbsorbedByTheClampWithoutAStep()
         {
             var mapper = CreateMapper();
 
             // 600 universes at 60 Hz: 36k packets/s, one every ~28 us. A CLOCK_REALTIME
-            // step back of 8 ms is under the reorder tolerance, so it is clamped rather
-            // than re-anchored — the timeline must not stay pinned.
+            // step back of 8 ms is under the reorder tolerance, and the clamp simply
+            // absorbs it: the kernel clock undoes the deficit within its own size, so the
+            // hold ends on its own without ever being called a step. The tie is bounded by
+            // the tolerance — under 10 ms of stream time, less than one frame period at
+            // 40-60 Hz — so no universe loses more than about a single frame's timestamp.
             const double PacketIntervalMS = 1000.0 / 36000;
             long kernelNS = KernelOriginNS;
             long monotonicNS = 0;
@@ -284,11 +288,8 @@ namespace Haukcode.HighPerfComm.Tests
                 lastOutput = output;
             }
 
-            // The hold must not last until the clock catches up — that would tie ~290
-            // frames to one timestamp. It is reclassified as the step it is once the hold
-            // is both long and deep, and the recording keeps moving.
-            Assert.InRange(clamped, 1, 100);
-            Assert.Equal(1, mapper.Steps);
+            Assert.InRange(clamped, 250, 320);
+            Assert.Equal(0, mapper.Steps);
             Assert.True(lastOutput > outputBeforeStep + Ms(40), "timeline resumed after the hold");
         }
 
