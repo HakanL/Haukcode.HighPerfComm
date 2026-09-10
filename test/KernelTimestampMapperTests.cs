@@ -203,6 +203,49 @@ namespace Haukcode.HighPerfComm.Tests
         }
 
         [Fact]
+        public void RssQueueBatch_IsClampedWholeAndNeverReportedAsAStep()
+        {
+            var mapper = CreateMapper();
+
+            // The measured Windows shape: an Intel I210 with 2 RSS queues and software
+            // timestamping, where a large sACN stream's destination groups hash across both
+            // queues. One queue's moderated batch is indicated after the other's, so a long
+            // run of packets carries stamps a few hundred microseconds behind the high-water
+            // mark — 40 of them inside 0.3 ms, far past the packet-count bound but nowhere
+            // near the time bound. Not one of these may be reported as a clock step.
+            long kernelNS = KernelOriginNS;
+            mapper.Map(kernelNS, 0);
+            mapper.Map(kernelNS + Ms(0.4), Ms(0.01));
+
+            for (int i = 0; i < 40; i++)
+            {
+                mapper.Map(kernelNS + Ms(0.1 + i * 0.002), Ms(0.02 + i * 0.0075));
+            }
+
+            Assert.Equal(0, mapper.Steps);
+            Assert.Equal(40, mapper.Reorders);
+        }
+
+        [Fact]
+        public void SlowStreamReorder_SpanningAFramePeriod_IsNotAStep()
+        {
+            var mapper = CreateMapper();
+
+            // A handful of universes at 40 Hz: an isolated swap holds across a whole 25 ms
+            // frame, which is well past the time bound but only one packet deep. The count
+            // bound has to save it — on a stream this slow a real sub-tolerance step never
+            // opens a hold at all, because one frame gap already outruns it.
+            long kernelNS = KernelOriginNS;
+            mapper.Map(kernelNS, 0);
+            mapper.Map(kernelNS + Ms(25), Ms(25));
+            var result = mapper.Map(kernelNS + Ms(24.9), Ms(50));
+
+            Assert.False(result.Stepped);
+            Assert.Equal(0, mapper.Steps);
+            Assert.Equal(1, mapper.Reorders);
+        }
+
+        [Fact]
         public void SubToleranceBackwardStep_HoldsTheTimelineBriefly_ThenResumes()
         {
             var mapper = CreateMapper();
@@ -242,9 +285,9 @@ namespace Haukcode.HighPerfComm.Tests
             }
 
             // The hold must not last until the clock catches up — that would tie ~290
-            // frames to one timestamp. It is reclassified as the step it is after a
-            // handful of packets, and the recording keeps moving.
-            Assert.InRange(clamped, 1, KernelTimestampMapper.MaxConsecutiveReorders);
+            // frames to one timestamp. It is reclassified as the step it is once the hold
+            // is both long and deep, and the recording keeps moving.
+            Assert.InRange(clamped, 1, 100);
             Assert.Equal(1, mapper.Steps);
             Assert.True(lastOutput > outputBeforeStep + Ms(40), "timeline resumed after the hold");
         }

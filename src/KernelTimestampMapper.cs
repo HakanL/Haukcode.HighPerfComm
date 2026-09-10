@@ -71,17 +71,22 @@ namespace Haukcode.HighPerfComm
         public const long ReorderToleranceNS = 10_000_000;
 
         /// <summary>
-        /// How many consecutive packets may be held before the hold is reclassified as a
-        /// clock step. Reordering spans a packet or two even across several receive queues;
-        /// a run this long means the timeline is genuinely behind.
+        /// Packet-count bound on a hold. Deliberately generous: a run of reordered packets
+        /// is not one or two, it is however many the NIC indicates in a batch. With RSS the
+        /// destination groups of a large sACN stream hash across receive queues, each queue
+        /// is drained by its own DPC on its own core, and interrupt moderation makes those
+        /// batches big — a measured Windows box (Intel I210, 2 RSS queues, *SoftwareTimestamp
+        /// RxAll) produced runs well past 8, which is what made an earlier cap of that size
+        /// report thousands of false steps.
         /// </summary>
-        public const int MaxConsecutiveReorders = 8;
+        public const int MaxConsecutiveReorders = 32;
 
         /// <summary>
-        /// Wall-clock bound on the same hold, for streams too slow to reach
-        /// <see cref="MaxConsecutiveReorders"/> quickly (a handful of universes at 40 Hz).
+        /// Wall-clock bound on the same hold. Queue skew resolves in well under a
+        /// millisecond (measured: 99 % of holds under 0.5 ms, none over 2 ms that were not
+        /// genuine), while a real sub-tolerance step back holds until the clock catches up.
         /// </summary>
-        public const long ReorderHoldLimitNS = 20_000_000;
+        public const long ReorderHoldLimitNS = 2_000_000;
 
         private readonly double ticksPerNanosecond;
         private readonly double nanosecondsPerTick;
@@ -169,15 +174,21 @@ namespace Haukcode.HighPerfComm
                 // is and leave the anchor alone so the next in-order packet maps normally;
                 // re-anchoring here would throw away kernel precision on every reorder.
                 //
-                // Magnitude alone cannot tell the two apart, so persistence decides: a
-                // reorder is over in a packet or two, while a genuine sub-tolerance clock
-                // step leaves EVERY later packet behind. Holding through one of those would
-                // tie the whole recording to one timestamp until the clock caught up — at
-                // 36k packets/s a 8 ms step-back is ~290 tied frames — so once the hold
-                // outlives either bound it is a step after all and re-anchors.
+                // Magnitude alone cannot tell the two apart, so persistence decides: queue
+                // skew resolves as soon as the lagging queue is drained, while a genuine
+                // sub-tolerance clock step leaves EVERY later packet behind. Holding through
+                // one of those would tie the whole recording to one timestamp until the clock
+                // caught up — at 36k packets/s an 8 ms step-back is ~290 tied frames.
+                //
+                // Both bounds must be exceeded, because each one alone misreads a different
+                // stream. A fast stream reorders in bulk but briefly, so the count says step
+                // and the clock says no. A slow stream reorders one packet across a whole
+                // frame period, so the clock says step and the count says no — and there a
+                // real step never opens a hold at all, since one frame gap already outruns
+                // it. Only a hold that is both long and deep is the real thing.
                 this.consecutiveReorders++;
 
-                if (this.consecutiveReorders <= MaxConsecutiveReorders &&
+                if (this.consecutiveReorders <= MaxConsecutiveReorders ||
                     monotonicTicks - this.lastMonotonicTicks <= this.reorderHoldLimitTicks)
                 {
                     this.reorders++;
