@@ -13,15 +13,18 @@ namespace Haukcode.HighPerfComm
     /// Detection is deliberately asymmetric:
     /// <list type="bullet">
     /// <item>
-    /// Forward step: the kernel advanced more than Stopwatch by <see cref="StepThresholdNS"/>
+    /// Forward step: the kernel advanced more than Stopwatch by <see cref="ForwardStepThresholdNS"/>
     /// since the previous packet. Queue delay cannot produce this (it makes Stopwatch run
-    /// ahead of the kernel, not behind). A burst drain also cannot: each queued packet's
-    /// kernel delta is one frame period, well under the threshold.
+    /// ahead of the kernel, not behind). A burst drain *can*, though — not per packet, but
+    /// once at the end, when the socket buffer overflowed and the replayed backlog runs out:
+    /// that jump is real traffic loss and must reach the caller, which is why the threshold
+    /// sits above any gap a stalled loop can open rather than just above frame jitter.
     /// </item>
     /// <item>
     /// Backward step: the mapped tick would go backwards by more than
-    /// <see cref="ReorderToleranceNS"/>. Queue delay never does that because kernel arrival
-    /// times still increase; an NTP step-back does.
+    /// <see cref="ReorderToleranceNS"/>, or by less than that for longer than a reorder can
+    /// last (see <see cref="MaxConsecutiveReorders"/>). Queue delay never moves the mapped
+    /// tick backwards because kernel arrival times still increase; an NTP step-back does.
     /// </item>
     /// </list>
     /// A backward move *within* the tolerance is packet reordering, not a clock step: the
@@ -40,11 +43,23 @@ namespace Haukcode.HighPerfComm
     {
         /// <summary>
         /// Divergence larger than this between a kernel delta and the matching Stopwatch
-        /// delta is treated as a clock step. 250 ms is several DMX frame periods (16.7–25 ms)
-        /// and well above typical scheduling jitter, but far below a Pi's first NTP correction
-        /// (often seconds to hours, with no battery-backed RTC).
+        /// delta is treated as a forward clock step.
+        ///
+        /// This has to clear the largest gap a loaded receive loop can produce, not just
+        /// scheduling jitter. When the loop stalls long enough to overflow the socket
+        /// buffer, the drain replays the buffered (old) packets first, so the jump lands at
+        /// the END of the burst and measures stall duration minus buffer depth — hundreds of
+        /// milliseconds under load. An earlier 250 ms threshold swallowed those: routing 600
+        /// universes at 60 Hz on a CM4 logged 86 "forward step absorbed" warnings in 15
+        /// minutes (and none at 40 Hz, which no clock event would explain). Absorbing them is
+        /// actively harmful — it erases the gap from the timeline, so a recording looks
+        /// continuous across traffic that was actually lost and the stream-gap detector
+        /// downstream never sees it.
+        ///
+        /// 2 s stays far below a Pi's first NTP correction (seconds to hours, with no
+        /// battery-backed RTC) while letting load-induced gaps through to be reported.
         /// </summary>
-        public const long StepThresholdNS = 250_000_000;
+        public const long ForwardStepThresholdNS = 2_000_000_000;
 
         /// <summary>
         /// A mapped tick that lands this far behind the previous one or less is treated as
@@ -55,9 +70,23 @@ namespace Haukcode.HighPerfComm
         /// </summary>
         public const long ReorderToleranceNS = 10_000_000;
 
+        /// <summary>
+        /// How many consecutive packets may be held before the hold is reclassified as a
+        /// clock step. Reordering spans a packet or two even across several receive queues;
+        /// a run this long means the timeline is genuinely behind.
+        /// </summary>
+        public const int MaxConsecutiveReorders = 8;
+
+        /// <summary>
+        /// Wall-clock bound on the same hold, for streams too slow to reach
+        /// <see cref="MaxConsecutiveReorders"/> quickly (a handful of universes at 40 Hz).
+        /// </summary>
+        public const long ReorderHoldLimitNS = 20_000_000;
+
         private readonly double ticksPerNanosecond;
         private readonly double nanosecondsPerTick;
         private readonly long reorderToleranceTicks;
+        private readonly long reorderHoldLimitTicks;
         private long baseNS;
         private long baseTicks;
         private long lastKernelNS;
@@ -66,6 +95,7 @@ namespace Haukcode.HighPerfComm
         private bool anchored;
         private int steps;
         private int reorders;
+        private int consecutiveReorders;
 
         /// <param name="stopwatchFrequency">
         /// Ticks per second of the monotonic clock. 0 (the default) uses
@@ -77,6 +107,7 @@ namespace Haukcode.HighPerfComm
             this.ticksPerNanosecond = frequency / 1_000_000_000.0;
             this.nanosecondsPerTick = 1_000_000_000.0 / frequency;
             this.reorderToleranceTicks = (long)(ReorderToleranceNS * this.ticksPerNanosecond);
+            this.reorderHoldLimitTicks = (long)(ReorderHoldLimitNS * this.ticksPerNanosecond);
         }
 
         /// <summary>
@@ -100,6 +131,7 @@ namespace Haukcode.HighPerfComm
             this.lastMonotonicTicks = 0;
             this.steps = 0;
             this.reorders = 0;
+            this.consecutiveReorders = 0;
         }
 
         /// <summary>
@@ -128,7 +160,7 @@ namespace Haukcode.HighPerfComm
 
             long backwardTicks = this.lastOutputTicks - mappedTicks;
 
-            bool forwardStep = kernelDeltaNS - monotonicDeltaNS > StepThresholdNS;
+            bool forwardStep = kernelDeltaNS - monotonicDeltaNS > ForwardStepThresholdNS;
             bool backwardStep = backwardTicks > this.reorderToleranceTicks;
 
             if (!forwardStep && !backwardStep && backwardTicks > 0)
@@ -136,10 +168,27 @@ namespace Haukcode.HighPerfComm
                 // Out-of-order arrival stamps, not a clock step. Hold the timeline where it
                 // is and leave the anchor alone so the next in-order packet maps normally;
                 // re-anchoring here would throw away kernel precision on every reorder.
-                this.reorders++;
+                //
+                // Magnitude alone cannot tell the two apart, so persistence decides: a
+                // reorder is over in a packet or two, while a genuine sub-tolerance clock
+                // step leaves EVERY later packet behind. Holding through one of those would
+                // tie the whole recording to one timestamp until the clock caught up — at
+                // 36k packets/s a 8 ms step-back is ~290 tied frames — so once the hold
+                // outlives either bound it is a step after all and re-anchors.
+                this.consecutiveReorders++;
 
-                return new KernelTimestampMapResult(this.lastOutputTicks);
+                if (this.consecutiveReorders <= MaxConsecutiveReorders &&
+                    monotonicTicks - this.lastMonotonicTicks <= this.reorderHoldLimitTicks)
+                {
+                    this.reorders++;
+
+                    return new KernelTimestampMapResult(this.lastOutputTicks);
+                }
+
+                backwardStep = true;
             }
+
+            this.consecutiveReorders = 0;
 
             if (forwardStep || backwardStep)
             {
