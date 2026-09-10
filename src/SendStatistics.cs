@@ -20,5 +20,12 @@ namespace Haukcode.HighPerfComm
         public HistogramBase? SendStats { get; set; }
 
         public HistogramBase? AgeStats { get; set; }
+
+        /// <summary>
+        /// Sum of the send durations (Stopwatch ticks) of the packets <see cref="SendStats"/>
+        /// covers, over the same interval: the total time the sender threads spent in the
+        /// socket. Equal to summing every bucket of the histogram, without the walk.
+        /// </summary>
+        public long TotalSendTicks { get; set; }
     }
 }

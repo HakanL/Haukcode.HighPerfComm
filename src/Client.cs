@@ -29,6 +29,11 @@ namespace Haukcode.HighPerfComm
         private HistogramBase? sendIntervalHistogram;
         private HistogramBase? ageIntervalHistogram;
 
+        // Sum of SendPacket durations (Stopwatch ticks) over the current statistics interval,
+        // for the same packets the send histogram records. Kept as a running total so the
+        // caller does not have to walk every histogram bucket once a second to get it.
+        private long intervalSendTicks;
+
         // One queue + one dedicated thread + (in the derived client) one socket per sender shard.
         // A single sender thread is CPU-bound at ~20 us per packet on an RPi4 -- the cost is the
         // kernel's per-packet UDP/IP/multicast work, not syscall entry, so batching (sendmmsg)
@@ -209,18 +214,18 @@ namespace Haukcode.HighPerfComm
             // ArgumentOutOfRangeException (TotalCount no longer matches the bucket sums).
             this.sendRecorder = HistogramFactory
                 .With64BitBucketSize()                  //LongConcurrentHistogram
-                .WithValuesFrom(1)                      //Default value
-                .WithValuesUpTo(TimeStamp.Minutes(1))   //Default value
-                .WithPrecisionOf(3)                     //Default value
+                .WithValuesFrom(1)
+                .WithValuesUpTo(TimeStamp.Seconds(10))  // anything longer is a failure, not a statistic
+                .WithPrecisionOf(2)                     // 1 % resolution; a tenth of the bucket array of 3 digits at a minute
                 .WithThreadSafeWrites()
                 .WithThreadSafeReads()                  //returns a Recorder
                 .Create();
 
             this.ageRecorder = HistogramFactory
                 .With64BitBucketSize()                  //LongConcurrentHistogram
-                .WithValuesFrom(1)                      //Default value
-                .WithValuesUpTo(TimeStamp.Minutes(1))   //Default value
-                .WithPrecisionOf(3)                     //Default value
+                .WithValuesFrom(1)
+                .WithValuesUpTo(TimeStamp.Seconds(10))  // anything longer is a failure, not a statistic
+                .WithPrecisionOf(2)                     // 1 % resolution; a tenth of the bucket array of 3 digits at a minute
                 .WithThreadSafeWrites()
                 .WithThreadSafeReads()                  //returns a Recorder
                 .Create();
@@ -370,7 +375,8 @@ namespace Haukcode.HighPerfComm
                 FullQueue = this.fullQueue,
                 TotalPackets = this.totalPackets,
                 SendStats = sendStatsCopy,
-                AgeStats = ageStatsCopy
+                AgeStats = ageStatsCopy,
+                TotalSendTicks = Interlocked.Exchange(ref this.intervalSendTicks, 0)
             };
 
             if (reset)
@@ -452,6 +458,7 @@ namespace Haukcode.HighPerfComm
                             // Ignore recording important packets since we may have a burst of a lot of them (blackouts for example)
                             long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
                             this.sendRecorder.RecordValue(elapsedTicks);
+                            Interlocked.Add(ref this.intervalSendTicks, elapsedTicks);
                         }
 
                         Interlocked.Increment(ref this.totalPackets);
