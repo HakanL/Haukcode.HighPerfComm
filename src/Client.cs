@@ -419,6 +419,14 @@ namespace Haukcode.HighPerfComm
         /// </summary>
         public int KernelClockSteps => this.kernelTimestampMapper.Steps;
 
+        /// <summary>
+        /// Number of out-of-order kernel receive timestamps clamped since the last
+        /// <see cref="StartReceive"/>. Multi-queue NICs stamp packets that then get dequeued
+        /// in the other order; the sub-millisecond reversal is held flat rather than treated
+        /// as a clock step. A nonzero value is normal — watch the rate, not the count.
+        /// </summary>
+        public int KernelTimestampReorders => this.kernelTimestampMapper.Reorders;
+
         protected void StartReceive()
         {
             if (this.receiverCTS != null)

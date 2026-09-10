@@ -130,6 +130,39 @@ namespace Haukcode.HighPerfComm.Tests
         }
 
         [Fact]
+        public void ReorderedPacket_IsClampedAndNotAStep()
+        {
+            var mapper = CreateMapper();
+            mapper.Map(KernelOriginNS, 0);
+            mapper.Map(KernelOriginNS + Ms(25), Ms(25));
+
+            // Two packets stamped 0.2 ms apart on different receive queues, dequeued in the
+            // other order. This is not a clock step and must not be reported as one.
+            var result = mapper.Map(KernelOriginNS + Ms(24.8), Ms(25.1));
+
+            Assert.Equal(Ms(25), result.TimestampTicks);
+            Assert.False(result.Stepped);
+            Assert.Equal(0, mapper.Steps);
+            Assert.Equal(1, mapper.Reorders);
+        }
+
+        [Fact]
+        public void AfterReorder_KernelPrecisionIsPreserved()
+        {
+            var mapper = CreateMapper();
+            mapper.Map(KernelOriginNS, 0);
+            mapper.Map(KernelOriginNS + Ms(25), Ms(25));
+            mapper.Map(KernelOriginNS + Ms(24.8), Ms(25.1));
+
+            // The anchor was left alone, so the next in-order packet still maps by its
+            // kernel delta rather than by however long the receive loop took.
+            long output = mapper.Map(KernelOriginNS + Ms(50), Ms(70)).TimestampTicks;
+
+            Assert.Equal(Ms(50), output);
+            Assert.Equal(0, mapper.Steps);
+        }
+
+        [Fact]
         public void JitterUnderThreshold_IsNotAStep()
         {
             var mapper = CreateMapper();
@@ -156,6 +189,7 @@ namespace Haukcode.HighPerfComm.Tests
 
             Assert.Equal(Ms(100), output);
             Assert.Equal(0, mapper.Steps);
+            Assert.Equal(0, mapper.Reorders);
         }
     }
 }
