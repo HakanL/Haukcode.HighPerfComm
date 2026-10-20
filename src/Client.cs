@@ -865,9 +865,11 @@ namespace Haukcode.HighPerfComm
                         this.errorSubject.OnNext(ex);
                     }
 
-                    if (ex is System.Net.Sockets.SocketException)
+                    if (ex is System.Net.Sockets.SocketException socketException &&
+                        socketException.SocketErrorCode != System.Net.Sockets.SocketError.MessageSize)
                     {
                         // Transient receive failure during a NIC flap — back off briefly and keep listening.
+                        // Not for an oversize datagram: that one is gone and the socket is fine.
                         Thread.Sleep(100);
                     }
                 }

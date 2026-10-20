@@ -26,6 +26,7 @@ namespace Haukcode.HighPerfComm
         private const int SOL_SOCKET = 1;
         private const int SO_TIMESTAMPNS = 35;      // SO_TIMESTAMPNS_OLD: 64-bit time_t timespec on arm64/x64
         private const int IPPROTO_IP = 0;
+        private const int MSG_TRUNC = 0x20;
         private const int IP_PKTINFO = 8;
         private const ushort AF_INET = 2;
 
@@ -121,6 +122,7 @@ namespace Haukcode.HighPerfComm
             int errorCode = 0;
             uint nameLen;
             int controlLen;
+            int msgFlags = 0;
 
             fixed (byte* dataPtr = &buffer.Array![buffer.Offset])
             fixed (byte* namePtr = this.nameBuffer)
@@ -154,12 +156,18 @@ namespace Haukcode.HighPerfComm
                 else
                 {
                     nameLen = msg.NameLen;
+                    msgFlags = msg.Flags;
                     controlLen = (int)msg.ControlLen;
                 }
             }
 
             if (received < 0)
                 throw new SocketException(errorCode);
+
+            // Larger than the buffer: the kernel cut it short. Drop it (0 bytes) rather than
+            // hand the parser a truncated datagram as if it were whole.
+            if ((msgFlags & MSG_TRUNC) != 0)
+                return 0;
 
             ParseControlMessages(controlLen, out kernelTimestampNS, out destinationAddress);
             if (kernelTimestampNS != 0)

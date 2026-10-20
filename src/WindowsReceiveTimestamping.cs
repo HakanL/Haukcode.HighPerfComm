@@ -44,6 +44,7 @@ namespace Haukcode.HighPerfComm
         private const int IP_PKTINFO = 19;
         private const ushort AF_INET = 2;
         private const int SOCKET_ERROR = -1;
+        private const int WSAEMSGSIZE = 10040;
 
         private static readonly Guid WSARecvMsgGuid = new Guid(0xf689d7c8, 0x6f1f, 0x436b, 0x8a, 0x53, 0xe5, 0x4f, 0xe3, 0x51, 0xc3, 0x22);
 
@@ -185,7 +186,14 @@ namespace Haukcode.HighPerfComm
             }
 
             if (result == SOCKET_ERROR)
+            {
+                // Larger than the buffer: the rest of the datagram is gone. Drop it (0 bytes)
+                // instead of reporting a socket failure, which the receive loop backs off on.
+                if (errorCode == WSAEMSGSIZE)
+                    return 0;
+
                 throw new SocketException(errorCode);
+            }
 
             ParseControlMessages(controlLen, out kernelTimestampNS, out destinationAddress);
             if (kernelTimestampNS != 0)
