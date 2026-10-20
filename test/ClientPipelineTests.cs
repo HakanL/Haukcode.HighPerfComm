@@ -63,9 +63,14 @@ namespace Haukcode.HighPerfComm.Tests
                 return packet.Length;
             }
 
+            public volatile bool FailSends;
+
             protected override int SendPacket(TestSendData sendData, ReadOnlyMemory<byte> payload, int senderIndex)
             {
                 SendGate.Wait();
+                if (FailSends)
+                    throw new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.NetworkUnreachable);
+
                 Sent.Enqueue((senderIndex, payload.ToArray()));
 
                 return payload.Length;
@@ -98,6 +103,44 @@ namespace Haukcode.HighPerfComm.Tests
                 if (condition())
                     return true;
                 Thread.Sleep(5);
+            }
+
+            return condition();
+        }
+
+        [Fact]
+        public async Task SustainedSendFailure_RecoversWhenSendsSucceedAgain()
+        {
+            using var client = new FakeClient(channelWriter: null)
+            {
+                SendFaultThresholdMS = 200,
+                SendFaultProbeIntervalMS = 100
+            };
+
+            // Fail long enough to trip the fault
+            client.FailSends = true;
+            Assert.True(await QueueUntil(client, () => !client.IsOperational), "The fault never tripped");
+            Assert.Empty(client.Sent);
+
+            // The network is back: a probe gets through and clears the fault
+            client.FailSends = false;
+            Assert.True(await QueueUntil(client, () => !client.Sent.IsEmpty), "Nothing was sent after recovery");
+            Assert.True(client.IsOperational);
+        }
+
+        private static async Task<bool> QueueUntil(FakeClient client, Func<bool> condition)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (condition())
+                    return true;
+
+                // Like a sender at 100 Hz: queue only when the client says it's operational
+                if (client.IsOperational)
+                    await client.Queue(new byte[] { 1 }, important: false, shardKey: 0);
+
+                await Task.Delay(10);
             }
 
             return condition();

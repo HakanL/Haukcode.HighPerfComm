@@ -78,8 +78,14 @@ namespace Haukcode.HighPerfComm
 
         private long lastSuccessfulSendTimestamp = Stopwatch.GetTimestamp();
         private long firstSendFailureTimestamp;
+        private long lastSendAttemptTimestamp;
         private long lastErrorEmitTimestamp;
-        private const double SendFaultThresholdMS = 3_000;
+
+        // How long sends must keep failing before the client stops queueing, and how often a
+        // packet is let through after that to find out whether the network is back. Internal
+        // so tests can shorten them.
+        internal double SendFaultThresholdMS { get; set; } = 3_000;
+        internal double SendFaultProbeIntervalMS { get; set; } = 1_000;
         private const double ErrorEmitThrottleMS = 5_000;
 
         /// <summary>
@@ -306,14 +312,26 @@ namespace Haukcode.HighPerfComm
         protected abstract TPacketType? TryParseObject(ReadOnlyMemory<byte> buffer, double timestampMS, IPEndPoint sourceIP, IPAddress destinationIP);
 #endif
 
-        public bool IsOperational => !this.senderCTS.IsCancellationRequested && !HasSustainedSendFailure;
+        /// <summary>
+        /// False once the client is disposed, or while sends have been failing for longer than
+        /// the fault threshold. During a sustained failure it turns true again for a moment
+        /// about once a second, so one packet can go out as a probe; the first probe that
+        /// succeeds clears the fault. Without the probe nothing would ever be sent again, and
+        /// the fault could never clear.
+        /// </summary>
+        public bool IsOperational => !this.senderCTS.IsCancellationRequested && (!HasSustainedSendFailure || SendProbeDue);
 
         // True once sends have been failing continuously for longer than the
         // threshold (e.g. the NIC we bound to went away after a network change).
         // Resets as soon as a single send succeeds.
         private bool HasSustainedSendFailure
-            => this.firstSendFailureTimestamp != 0
-                && ElapsedMs(this.firstSendFailureTimestamp) >= SendFaultThresholdMS;
+            => Interlocked.Read(ref this.firstSendFailureTimestamp) != 0
+                && ElapsedMs(Interlocked.Read(ref this.firstSendFailureTimestamp)) >= SendFaultThresholdMS;
+
+        // The sender stamps every attempt, so between probes this is false and packets are
+        // discarded rather than building up a backlog behind the dead link.
+        private bool SendProbeDue
+            => ElapsedMs(Interlocked.Read(ref this.lastSendAttemptTimestamp)) >= SendFaultProbeIntervalMS;
 
         private static double ElapsedMs(long startTimestamp)
             => (Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / Stopwatch.Frequency;
@@ -464,7 +482,9 @@ namespace Haukcode.HighPerfComm
                         Interlocked.Increment(ref this.totalPackets);
 
                         // Successful send clears any pending fault state.
-                        Interlocked.Exchange(ref this.lastSuccessfulSendTimestamp, Stopwatch.GetTimestamp());
+                        long now = Stopwatch.GetTimestamp();
+                        Interlocked.Exchange(ref this.lastSuccessfulSendTimestamp, now);
+                        Interlocked.Exchange(ref this.lastSendAttemptTimestamp, now);
                         Interlocked.Exchange(ref this.firstSendFailureTimestamp, 0);
                     }
                     catch (Exception ex)
@@ -479,6 +499,7 @@ namespace Haukcode.HighPerfComm
                             // first should stamp the fault, or the fault window keeps restarting
                             // and HasSustainedSendFailure never trips.
                             Interlocked.CompareExchange(ref this.firstSendFailureTimestamp, Stopwatch.GetTimestamp(), 0);
+                            Interlocked.Exchange(ref this.lastSendAttemptTimestamp, Stopwatch.GetTimestamp());
 
                             // Throttle notifications so a persistent failure (e.g. the bound
                             // NIC went away after a network change) doesn't spam the log once
