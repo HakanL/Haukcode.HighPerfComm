@@ -416,6 +416,10 @@ Typical performance (on modern hardware):
   - System.Threading.Channels (for async queuing)
   - System.Reactive (for error notifications)
 
+## Used in production
+
+This library is used in [DMX Core 100](https://dmxcore.com), a DMX lighting controller for permanent installations that runs on Windows, macOS and Linux, or on its own touchscreen hardware. There it is the send and receive engine under its sACN, Art-Net, KiNet and Sig-Net support.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests on [GitHub](https://github.com/HakanL/Haukcode.HighPerfComm).
